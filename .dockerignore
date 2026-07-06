@@ -1,0 +1,7 @@
+.git
+.gitignore
+*.md
+deploy/
+azure-pipelines.yml
+Dockerfile
+.dockerignore
