@@ -9,7 +9,7 @@ fullnameOverride: ""
 replicaCount: 2
 
 image:
-  repository: auth-gateway
+  repository: ghcr.io/elemermelada/auth-gateway/auth-gateway
   tag: "latest"
   pullPolicy: IfNotPresent
 
