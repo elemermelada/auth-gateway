@@ -1,0 +1,17 @@
+apiVersion: v2
+name: auth-gateway
+description: |
+  Oauth2-Proxy instance selector frontdoor — a tiny, stateless Go reverse proxy
+  that routes by its own cookie between two oauth2-proxy instances behind a
+  single hostname/ingress.
+type: application
+# version   → the chart version, bump on any chart change
+# appVersion→ the app version, tracks the auth-gateway image
+version: 0.1.0
+appVersion: "latest"
+keywords:
+  - oauth2-proxy
+  - auth
+  - reverse-proxy
+sources:
+  - https://github.com/zenztech/auth-gateway
