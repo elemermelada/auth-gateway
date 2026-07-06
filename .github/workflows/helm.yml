@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'charts/**'
+      - '.github/workflows/helm.yml'
   pull_request:
     branches:
       - main
@@ -43,14 +46,31 @@ jobs:
       - name: Package chart
         run: helm package ${{ env.CHART_DIR }} --destination dist
 
-      # Only needed when we actually push (main). Harmless to run always.
+      # Needed for the push (main) and for the version guard's registry read on
+      # PRs. Harmless to run always.
       - name: Log in to GitHub Container Registry
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR tags are mutable, so `helm push` would silently overwrite an
+      # already-published version. Fail instead, forcing a Chart.yaml version
+      # bump on every chart change. `helm show chart` succeeds only if the
+      # version already exists in the registry.
+      - name: Fail if chart version already published
+        run: |
+          META=$(helm show chart dist/*.tgz)
+          NAME=$(echo "$META" | yq '.name')
+          VERSION=$(echo "$META" | yq '.version')
+          REF="oci://ghcr.io/${{ github.repository }}/${NAME}"
+          echo "Checking whether ${REF}:${VERSION} already exists..."
+          if helm show chart "${REF}" --version "${VERSION}" > /dev/null 2>&1; then
+            echo "::error::Chart ${NAME} version ${VERSION} is already published. Bump 'version:' in ${{ env.CHART_DIR }}/Chart.yaml."
+            exit 1
+          fi
+          echo "Version ${VERSION} not yet published — OK to push."
 
       # helm push derives the OCI package name from the chart's `name:` field,
       # so this publishes to ghcr.io/<repo>/auth-gateway-chart:<version>.
