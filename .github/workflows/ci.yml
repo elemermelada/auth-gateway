@@ -7,6 +7,14 @@ on:
   pull_request:
     branches:
       - main
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'selector.html'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/ci.yml'
 
 env:
   IMAGE_NAME: auth-gateway
