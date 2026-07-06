@@ -30,5 +30,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpat
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 COPY --from=build /out/auth-gateway /auth-gateway
 EXPOSE 8080
-USER nonroot:nonroot
+# Numeric UID/GID (distroless "nonroot" = 65532) so Kubernetes' runAsNonRoot
+# can verify the user is non-root without a username lookup.
+USER 65532:65532
 ENTRYPOINT ["/auth-gateway"]
