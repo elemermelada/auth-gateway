@@ -34,7 +34,7 @@ func testHandler(t *testing.T) (http.Handler, func()) {
 		"primary":   newProxy(mustParse(t, primary.URL)),
 		"secondary": newProxy(mustParse(t, secondary.URL)),
 	}
-	h := newHandler("auth_mode", []byte("<html>SELECTOR</html>"), proxies)
+	h := newHandler("auth_mode", true, []byte("<html>SELECTOR</html>"), proxies)
 	return h, func() { primary.Close(); secondary.Close() }
 }
 
@@ -144,6 +144,29 @@ func TestSelectSetsCookieAndRedirects(t *testing.T) {
 	}
 }
 
+// TestSelectInsecureCookie verifies that with cookieSecure=false the routing
+// cookie is written without the Secure attribute, so browsers attach it to
+// plaintext http/ws requests (local dev, before a TLS-terminating ingress).
+func TestSelectInsecureCookie(t *testing.T) {
+	proxies := map[string]http.Handler{}
+	h := newHandler("auth_mode", false, nil, proxies)
+
+	req := httptest.NewRequest(http.MethodGet, "/.auth/select?mode=primary", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	sc := rec.Result().Cookies()
+	if len(sc) != 1 || sc[0].Value != "primary" {
+		t.Fatalf("cookie not set: %+v", sc)
+	}
+	if sc[0].Secure {
+		t.Fatalf("cookie should not be Secure when cookieSecure=false")
+	}
+	if !sc[0].HttpOnly {
+		t.Fatalf("cookie should remain HttpOnly")
+	}
+}
+
 func TestSelectInvalidMode(t *testing.T) {
 	h, cleanup := testHandler(t)
 	defer cleanup()
@@ -218,7 +241,7 @@ func TestWebSocketUpgradeProxied(t *testing.T) {
 	defer backend.Close()
 
 	proxies := map[string]http.Handler{"primary": newProxy(mustParse(t, backend.URL))}
-	gw := httptest.NewServer(newHandler("auth_mode", nil, proxies))
+	gw := httptest.NewServer(newHandler("auth_mode", true, nil, proxies))
 	defer gw.Close()
 
 	gwURL := mustParse(t, gw.URL)

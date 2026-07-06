@@ -28,6 +28,7 @@ func main() {
 	var (
 		listenAddr       = env("LISTEN_ADDR", ":8080")
 		cookieName       = env("COOKIE_NAME", "auth_mode")
+		cookieSecure     = env("COOKIE_SECURE", "true") != "false" // set false for local plaintext (http/ws)
 		backendPrimary   = mustURL("BACKEND_PRIMARY")
 		backendSecondary = mustURL("BACKEND_SECONDARY")
 	)
@@ -44,7 +45,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           newHandler(cookieName, selectorHTML, proxies),
+		Handler:           newHandler(cookieName, cookieSecure, selectorHTML, proxies),
 		MaxHeaderBytes:    1 << 20,           // large injected auth headers (X-Forwarded-Access-Token)
 		ReadHeaderTimeout: 10 * time.Second,  // slow-loris guard on headers only
 		// Deliberately NO ReadTimeout/WriteTimeout/IdleTimeout: they would sever
@@ -58,7 +59,7 @@ func main() {
 
 // newHandler wires the gateway routing: control endpoints first, then cookie-based
 // backend selection, falling back to the selector page / JSON 401.
-func newHandler(cookieName string, selectorHTML []byte, proxies map[string]http.Handler) http.Handler {
+func newHandler(cookieName string, cookieSecure bool, selectorHTML []byte, proxies map[string]http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Gateway-owned control endpoints, handled regardless of cookie state.
 		switch r.URL.Path {
@@ -67,7 +68,7 @@ func newHandler(cookieName string, selectorHTML []byte, proxies map[string]http.
 			_, _ = w.Write([]byte("ok"))
 			return
 		case "/.auth/select":
-			handleSelect(w, r, cookieName)
+			handleSelect(w, r, cookieName, cookieSecure)
 			return
 		}
 
@@ -119,7 +120,7 @@ func mode(r *http.Request, cookieName string) string {
 
 // handleSelect sets the routing cookie and redirects back to a validated,
 // same-origin relative path.
-func handleSelect(w http.ResponseWriter, r *http.Request, cookieName string) {
+func handleSelect(w http.ResponseWriter, r *http.Request, cookieName string, cookieSecure bool) {
 	q := r.URL.Query()
 	m := q.Get("mode")
 	if m != "primary" && m != "secondary" {
@@ -137,7 +138,7 @@ func handleSelect(w http.ResponseWriter, r *http.Request, cookieName string) {
 		Value:    m,
 		Path:     "/",
 		MaxAge:   cookieMaxAge,
-		Secure:   true,
+		Secure:   cookieSecure,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
