@@ -1,5 +1,9 @@
 apiVersion: v2
-name: auth-gateway
+# The chart's name doubles as the OCI package name on push
+# (ghcr.io/<repo>/auth-gateway-chart). It's suffixed with `-chart` to avoid
+# colliding with the container image package (ghcr.io/<repo>/auth-gateway).
+# Rendered resource names stay `auth-gateway` via nameOverride in values.yaml.
+name: auth-gateway-chart
 description: |
   Oauth2-Proxy instance selector frontdoor — a tiny, stateless Go reverse proxy
   that routes by its own cookie between two oauth2-proxy instances behind a

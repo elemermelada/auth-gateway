@@ -1,6 +1,11 @@
 ## Default values for auth-gateway.
 ## This is a YAML-formatted file.
 
+## Keep rendered resource names as `auth-gateway` even though the chart (and
+## its OCI package) is named `auth-gateway-chart`. Override if desired.
+nameOverride: "auth-gateway"
+fullnameOverride: ""
+
 replicaCount: 2
 
 image:
