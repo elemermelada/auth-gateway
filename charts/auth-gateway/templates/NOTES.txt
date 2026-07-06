@@ -1,0 +1,20 @@
+auth-gateway has been deployed. 🚪
+
+Release:   {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+Backends routed by the "{{ .Values.config.cookieName }}" cookie:
+  primary   → {{ .Values.config.backendPrimary }}
+  secondary → {{ .Values.config.backendSecondary }}
+
+{{- if eq .Values.service.type "ClusterIP" }}
+
+The Service is ClusterIP. To reach it locally:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "auth-gateway.fullname" . }} 8080:{{ .Values.service.port }}
+  # then open http://127.0.0.1:8080/healthz
+{{- end }}
+
+This chart does not manage an Ingress — auth-gateway wires ingresses to the
+right frontdoor itself. Just make sure your ingress' backend/websocket-services
+point at the "{{ include "auth-gateway.fullname" . }}" Service (see README).

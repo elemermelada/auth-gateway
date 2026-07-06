@@ -1,7 +1,7 @@
 .git
 .gitignore
 *.md
-deploy/
+charts/
 azure-pipelines.yml
 Dockerfile
 .dockerignore

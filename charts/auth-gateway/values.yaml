@@ -1,0 +1,70 @@
+## Default values for auth-gateway.
+## This is a YAML-formatted file.
+
+## Keep rendered resource names as `auth-gateway` even though the chart (and
+## its OCI package) is named `auth-gateway-chart`. Override if desired.
+nameOverride: "auth-gateway"
+fullnameOverride: ""
+
+replicaCount: 2
+
+image:
+  repository: auth-gateway
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+## auth-gateway configuration (rendered as container env vars).
+## BACKEND_PRIMARY / BACKEND_SECONDARY are required — point them at the two
+## oauth2-proxy Services in this namespace.
+config:
+  listenAddr: ":8080"
+  cookieName: "auth_mode"
+  backendPrimary: "http://oauth2-proxy-public"
+  backendSecondary: "http://oauth2-proxy-private"
+
+## Extra env vars appended verbatim (e.g. valueFrom / secretKeyRef).
+extraEnv: []
+  # - name: SOME_VAR
+  #   valueFrom:
+  #     secretKeyRef:
+  #       name: my-secret
+  #       key: some-key
+
+service:
+  type: ClusterIP
+  port: 80
+
+## Container port the app listens on (must match config.listenAddr).
+containerPort: 8080
+
+# NOTE: This chart intentionally does NOT manage an Ingress. auth-gateway owns
+# the responsibility of wiring ingresses to the correct frontdoor itself.
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 16Mi
+  limits:
+    cpu: 200m
+    memory: 64Mi
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 10
+
+podAnnotations: {}
+podLabels: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

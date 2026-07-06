@@ -1,0 +1,57 @@
+name: Helm
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  CHART_DIR: charts/auth-gateway
+
+jobs:
+  lint_package_push:
+    name: Lint, package & push chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: helm lint ${{ env.CHART_DIR }}
+
+      # Renders the templates to catch errors `helm lint` misses. The required
+      # backend values are supplied so the render doesn't fail on them.
+      - name: Template chart (render check)
+        run: |
+          helm template auth-gateway ${{ env.CHART_DIR }} \
+            --set config.backendPrimary=http://primary \
+            --set config.backendSecondary=http://secondary \
+            > /dev/null
+
+      - name: Package chart
+        run: helm package ${{ env.CHART_DIR }} --destination dist
+
+      # Only needed when we actually push (main). Harmless to run always.
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # helm push derives the OCI package name from the chart's `name:` field,
+      # so this publishes to ghcr.io/<repo>/auth-gateway-chart:<version>.
+      - name: Push chart
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          helm push dist/*.tgz oci://ghcr.io/${{ github.repository }}
