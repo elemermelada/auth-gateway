@@ -109,6 +109,9 @@ func newHandler(cookie cookieCfg, selectorHTML []byte, proxies map[string]http.H
 func newProxy(target *url.URL, cookie cookieCfg) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		ModifyResponse: func(resp *http.Response) error {
+			if rewriteAuthError(resp) {
+				return nil
+			}
 			promoteCookie(resp, cookie)
 			return nil
 		},
@@ -173,6 +176,36 @@ func promoteCookie(resp *http.Response, cookie cookieCfg) {
 		return // absent/unknown cookie, or already promoted — don't re-set every request
 	}
 	resp.Header.Add("Set-Cookie", routingCookie(cookie.name, m, cookie.maxAge).String())
+}
+
+// rewriteAuthError turns oauth2-proxy's own failure responses into a redirect to
+// /.auth/reset, so a user who picked the wrong IdP lands back on the selector
+// instead of on a dead sign-in error page. It reports whether it rewrote.
+//
+// Loop guard: this only fires on oauth2-proxy's own endpoints (/oauth2/*), never
+// on application 4xx responses, and /.auth/reset is served by the gateway itself
+// (never proxied) and clears the cookie — so the next request hits the selector.
+func rewriteAuthError(resp *http.Response) bool {
+	if resp.Request == nil || !isAuthPath(resp.Request.URL.Path) {
+		return false
+	}
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError:
+	default:
+		return false
+	}
+
+	_ = resp.Body.Close()
+	resp.Body = http.NoBody
+	resp.ContentLength = 0
+	resp.Header.Del("Content-Length")
+	resp.Header.Del("Content-Type")
+	resp.Header.Del("Etag")
+	resp.Header.Set("Cache-Control", "no-store")
+	resp.Header.Set("Location", "/.auth/reset?rd=/")
+	resp.StatusCode = http.StatusFound
+	resp.Status = strconv.Itoa(http.StatusFound) + " " + http.StatusText(http.StatusFound)
+	return true
 }
 
 // isAuthPath reports whether a path belongs to oauth2-proxy's own endpoints

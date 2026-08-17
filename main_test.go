@@ -260,6 +260,70 @@ func TestNoRepromotionOfFullCookie(t *testing.T) {
 	}
 }
 
+// oauth2-proxy answering 403 with its sign-in error page is the dead end users
+// got stuck on; it must become a redirect to /.auth/reset.
+func TestAuthErrorRewrittenToReset(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError} {
+		h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "sign-in failed", status)
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/oauth2/callback?code=x", nil)
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusFound {
+			t.Errorf("backend %d: gateway status = %d, want 302", status, rec.Code)
+		}
+		if loc := rec.Header().Get("Location"); loc != "/.auth/reset?rd=/" {
+			t.Errorf("backend %d: location = %q, want /.auth/reset?rd=/", status, loc)
+		}
+		if body := rec.Body.String(); strings.Contains(body, "sign-in failed") {
+			t.Errorf("backend %d: error page leaked through: %q", status, body)
+		}
+		cleanup()
+	}
+}
+
+// Application 4xx responses are none of the gateway's business — rewriting them
+// would break every app that returns 403 legitimately, and could loop.
+func TestAppErrorNotRewritten(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "app says no", http.StatusForbidden)
+	})
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/app/secret", nil)
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 passed through", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "app says no") {
+		t.Fatalf("app error body not preserved: %q", rec.Body.String())
+	}
+}
+
+// The normal oauth2 flow (302 to the provider, 200 sign-in page) must pass through.
+func TestAuthPathNonErrorNotRewritten(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://idp.example.com/authorize", http.StatusFound)
+	})
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/start", nil)
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if loc := rec.Header().Get("Location"); loc != "https://idp.example.com/authorize" {
+		t.Fatalf("location = %q, want the IdP redirect untouched", loc)
+	}
+}
+
 func TestCookieMode(t *testing.T) {
 	cases := []struct {
 		value    string
