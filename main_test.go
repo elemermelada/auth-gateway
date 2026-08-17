@@ -20,6 +20,9 @@ func mustParse(t *testing.T, raw string) *url.URL {
 	return u
 }
 
+// testCookie is the cookie config used by the test gateway.
+var testCookie = cookieCfg{name: "auth_mode", maxAge: cookieMaxAge, tempMaxAge: 600}
+
 // testHandler builds a gateway whose two backends echo their identity, so tests
 // can assert which backend a request was routed to.
 func testHandler(t *testing.T) (http.Handler, func()) {
@@ -31,11 +34,31 @@ func testHandler(t *testing.T) (http.Handler, func()) {
 		_, _ = io.WriteString(w, "backend=secondary")
 	}))
 	proxies := map[string]http.Handler{
-		"primary":   newProxy(mustParse(t, primary.URL)),
-		"secondary": newProxy(mustParse(t, secondary.URL)),
+		"primary":   newProxy(mustParse(t, primary.URL), testCookie),
+		"secondary": newProxy(mustParse(t, secondary.URL), testCookie),
 	}
-	h := newHandler("auth_mode", []byte("<html>SELECTOR</html>"), proxies)
+	h := newHandler(testCookie, []byte("<html>SELECTOR</html>"), proxies)
 	return h, func() { primary.Close(); secondary.Close() }
+}
+
+// testGatewayTo builds a gateway whose "primary" backend is the given handler,
+// for tests that need to control the backend's status code.
+func testGatewayTo(t *testing.T, backend http.HandlerFunc) (http.Handler, func()) {
+	t.Helper()
+	srv := httptest.NewServer(backend)
+	proxies := map[string]http.Handler{"primary": newProxy(mustParse(t, srv.URL), testCookie)}
+	return newHandler(testCookie, []byte("<html>SELECTOR</html>"), proxies), srv.Close
+}
+
+// routingCookieOf returns the Set-Cookie entry for the routing cookie, or nil.
+func routingCookieOf(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
+	t.Helper()
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == testCookie.name {
+			return c
+		}
+	}
+	return nil
 }
 
 func TestRoutingByCookie(t *testing.T) {
@@ -139,8 +162,125 @@ func TestSelectSetsCookieAndRedirects(t *testing.T) {
 		t.Fatalf("location = %q, want /dashboard", loc)
 	}
 	sc := rec.Result().Cookies()
-	if len(sc) != 1 || sc[0].Value != "secondary" || !sc[0].Secure || !sc[0].HttpOnly {
+	if len(sc) != 1 || sc[0].Value != "secondary"+tempSuffix || !sc[0].Secure || !sc[0].HttpOnly {
 		t.Fatalf("cookie not set correctly: %+v", sc)
+	}
+	// A fresh selection is unproven: it only gets the short lifetime.
+	if sc[0].MaxAge != testCookie.tempMaxAge {
+		t.Fatalf("MaxAge = %d, want temp %d", sc[0].MaxAge, testCookie.tempMaxAge)
+	}
+}
+
+// A temp cookie routes exactly like a promoted one — the marker must not break
+// backend selection.
+func TestTempCookieRoutes(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/some/path", nil)
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "secondary" + tempSuffix})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if got := rec.Body.String(); got != "backend=secondary" {
+		t.Fatalf("body = %q, want backend=secondary", got)
+	}
+}
+
+func TestPromotionOnSuccess(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/app", nil)
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	c := routingCookieOf(t, rec)
+	if c == nil {
+		t.Fatalf("temp cookie was not promoted (no Set-Cookie)")
+	}
+	if c.Value != "primary" || c.MaxAge != testCookie.maxAge {
+		t.Fatalf("promoted cookie = %+v, want value=primary MaxAge=%d", c, testCookie.maxAge)
+	}
+}
+
+func TestNoPromotionOnAuthFailure(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/app", nil)
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if c := routingCookieOf(t, rec); c != nil {
+			t.Errorf("status %d promoted the cookie: %+v", status, c)
+		}
+		cleanup()
+	}
+}
+
+// oauth2-proxy serves its own sign-in page with 200 under /oauth2/, which proves
+// nothing about the user being able to sign in — it must not promote.
+func TestNoPromotionOnAuthPath(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/sign_in", nil)
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if c := routingCookieOf(t, rec); c != nil {
+		t.Fatalf("/oauth2/ 200 promoted the cookie: %+v", c)
+	}
+}
+
+// An already-promoted cookie must not be re-set on every proxied request.
+func TestNoRepromotionOfFullCookie(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/app", nil)
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if c := routingCookieOf(t, rec); c != nil {
+		t.Fatalf("full cookie was re-set: %+v", c)
+	}
+}
+
+func TestCookieMode(t *testing.T) {
+	cases := []struct {
+		value    string
+		wantMode string
+		wantTemp bool
+	}{
+		{"primary", "primary", false},
+		{"secondary", "secondary", false},
+		{"primary" + tempSuffix, "primary", true},
+		{"secondary" + tempSuffix, "secondary", true},
+		{"bogus", "", false},
+		{"bogus" + tempSuffix, "", false},
+		{tempSuffix, "", false},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tc.value})
+		m, temp := cookieMode(req, "auth_mode")
+		if m != tc.wantMode || temp != tc.wantTemp {
+			t.Errorf("cookieMode(%q) = (%q, %v), want (%q, %v)", tc.value, m, temp, tc.wantMode, tc.wantTemp)
+		}
 	}
 }
 
@@ -289,8 +429,8 @@ func TestWebSocketUpgradeProxied(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	proxies := map[string]http.Handler{"primary": newProxy(mustParse(t, backend.URL))}
-	gw := httptest.NewServer(newHandler("auth_mode", nil, proxies))
+	proxies := map[string]http.Handler{"primary": newProxy(mustParse(t, backend.URL), testCookie)}
+	gw := httptest.NewServer(newHandler(testCookie, nil, proxies))
 	defer gw.Close()
 
 	gwURL := mustParse(t, gw.URL)
@@ -341,7 +481,7 @@ func TestProxyPreservesHostAndSetsXForwarded(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	p := newProxy(mustParse(t, backend.URL))
+	p := newProxy(mustParse(t, backend.URL), testCookie)
 	req := httptest.NewRequest(http.MethodGet, "http://app.example.com/x", nil)
 	req.RemoteAddr = "203.0.113.7:12345"
 	rec := httptest.NewRecorder()
