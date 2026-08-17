@@ -19,6 +19,11 @@ image:
 config:
   listenAddr: ":8080"
   cookieName: "auth_mode"
+  ## Lifetime (seconds) of the routing cookie right after the user picks a
+  ## provider. It is promoted to the full ~1 year only once a request succeeds
+  ## behind that provider, so a wrong choice expires by itself. Keep it long
+  ## enough to complete an interactive login.
+  cookieTempMaxAge: 600
   backendPrimary: "http://oauth2-proxy-public"
   backendSecondary: "http://oauth2-proxy-private"
 

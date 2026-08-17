@@ -40,6 +40,8 @@ spec:
               value: {{ .Values.config.listenAddr | quote }}
             - name: COOKIE_NAME
               value: {{ .Values.config.cookieName | quote }}
+            - name: COOKIE_TEMP_MAX_AGE
+              value: {{ .Values.config.cookieTempMaxAge | quote }}
             - name: BACKEND_PRIMARY
               value: {{ required "config.backendPrimary is required" .Values.config.backendPrimary | quote }}
             - name: BACKEND_SECONDARY

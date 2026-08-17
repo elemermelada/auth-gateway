@@ -19,11 +19,43 @@ ingress ──► auth-gateway ──┬─► oauth2-proxy-primary    ──►
 | Valid `auth_mode` cookie (`primary`\|`secondary`) | Reverse-proxy **all** paths (incl. `/oauth2/*`, WebSockets) to the matching backend |
 | No/unknown cookie + `GET` with `Accept: text/html` | `200` embedded selector page (two buttons) |
 | No/unknown cookie + anything else | `401` with small JSON body |
-| `GET /.auth/select?mode=<primary\|secondary>&rd=<path>` | Set cookie, `302` to `rd` (open-redirect–guarded; defaults to `/`) |
+| `GET /.auth/select?mode=<primary\|secondary>&rd=<path>` | Set cookie (short-lived, see below), `302` to `rd` (open-redirect–guarded; defaults to `/`) |
+| `GET /.auth/reset?rd=<path>` | **Delete** the cookie, `302` to `rd` (same guard, defaults to `/` → selector page) |
 | `GET /healthz` | `200` (liveness/readiness) |
+| Backend returns `401`/`403`/`500` on one of its own `/oauth2/*` endpoints | `302` to `/.auth/reset?rd=/` |
 
 There is **no mode-switch endpoint** by design — a stale oauth2-proxy session
-cookie after a manual switch just re-triggers login.
+cookie after a manual switch just re-triggers login. To change provider, hit
+`/.auth/reset` and pick again.
+
+## Undoing a wrong choice
+
+Picking the wrong provider used to be effectively permanent — the cookie lasted
+a year and every request was routed to an IdP that would never let the user in.
+Three mechanisms make it recoverable:
+
+1. **`/.auth/reset`** — deletes the routing cookie (with the exact attributes it
+   was set with, so the deletion actually matches) and sends the user back to the
+   selector. This is the manual escape hatch; link it from your app as
+   *"wrong provider? start over"* → `/.auth/reset?rd=/`.
+2. **Two-stage cookie lifetime.** `/.auth/select` issues the cookie with
+   `COOKIE_TEMP_MAX_AGE` (default `600`s) and the value marked `<mode>:tmp`. The
+   moment the backend answers `2xx` on a **non-`/oauth2/`** path — behind
+   oauth2-proxy that means the session is authenticated — the gateway re-issues
+   the cookie unmarked with the full ~1 year lifetime. So an unproven choice
+   expires on its own in minutes, a proven one stays sticky. The marker also
+   keeps the gateway from re-setting the cookie on every request. `/oauth2/*` is
+   excluded from promotion because oauth2-proxy serves its own sign-in page there
+   with a `200`.
+3. **Auto-redirect on auth error.** A `401`/`403`/`500` from an `/oauth2/*`
+   endpoint (oauth2-proxy's sign-in error page) is rewritten to a `302` to
+   `/.auth/reset?rd=/`, so the dead end becomes a fresh selection. This is scoped
+   to `/oauth2/*` so **application** 4xx responses pass through untouched, and it
+   cannot loop: `/.auth/reset` is served by the gateway itself and clears the
+   cookie.
+
+Both `<mode>` and `<mode>:tmp` route identically, so the marker is invisible to
+routing.
 
 ## Configuration (env vars)
 
@@ -33,6 +65,7 @@ cookie after a manual switch just re-triggers login.
 | `BACKEND_SECONDARY` | *(required)* | Full URL, e.g. `http://oauth2-proxy-secondary` |
 | `LISTEN_ADDR` | `:8080` | |
 | `COOKIE_NAME` | `auth_mode` | |
+| `COOKIE_TEMP_MAX_AGE` | `600` | Seconds a freshly selected, not-yet-proven mode lasts. Must be a positive integer; anything else falls back to the default with a log line. |
 
 The selector button labels live in [`selector.html`](selector.html) — edit them to
 match your two providers.
@@ -97,7 +130,7 @@ helm install auth-gateway ./charts/auth-gateway \
 - **Config is passed as env vars.** Everything under `config.*` in
   [`values.yaml`](charts/auth-gateway/values.yaml) is rendered into the
   container's `env` (`BACKEND_PRIMARY`, `BACKEND_SECONDARY`, `LISTEN_ADDR`,
-  `COOKIE_NAME`). `backendPrimary` / `backendSecondary` are **required** — the
+  `COOKIE_NAME`, `COOKIE_TEMP_MAX_AGE`). `backendPrimary` / `backendSecondary` are **required** — the
   chart fails to render (`helm template`/`install` errors) if they're unset, so
   a misconfigured gateway can't reach the cluster. Point them at the two
   oauth2-proxy Services.
