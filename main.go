@@ -48,7 +48,9 @@ func main() {
 		cookie           = cookieCfg{
 			name:       env("COOKIE_NAME", "auth_mode"),
 			maxAge:     cookieMaxAge,
-			tempMaxAge: envInt("COOKIE_TEMP_MAX_AGE", 600),
+			// 15m matches oauth2-proxy's default CSRF cookie expiry: past that the
+			// in-flight login can't complete anyway, so a longer window buys nothing.
+			tempMaxAge: envInt("COOKIE_TEMP_MAX_AGE", 900),
 		}
 	)
 

@@ -57,6 +57,27 @@ Three mechanisms make it recoverable:
 Both `<mode>` and `<mode>:tmp` route identically, so the marker is invisible to
 routing.
 
+### If the temp cookie expires mid-login
+
+It doesn't cost the user their login. The IdP redirects back to
+`/oauth2/callback?code=…&state=…`, the gateway finds no routing cookie and serves
+the **selector page at that callback URL**. The selector puts
+`location.pathname + location.search` into `rd`, so picking the provider again
+redirects straight back to the callback *with `code` and `state` intact* and
+oauth2-proxy completes the exchange — one extra click, no re-authentication.
+
+Two consequences worth knowing:
+
+- `COOKIE_TEMP_MAX_AGE` doesn't need slack for slow users. The real deadline is
+  oauth2-proxy's CSRF cookie (`--cookie-csrf-expire`, 15m by default) and the
+  IdP's authorization-code lifetime; once those lapse the resumed callback gets a
+  `403`, which the gateway turns into `/.auth/reset?rd=/` for a clean restart.
+  Hence the `900`s default.
+- Anything hand-building a `/.auth/select` link must **URL-encode `rd`**
+  (`encodeURIComponent`), or `&state=…` is parsed as a parameter of
+  `/.auth/select` and silently dropped from the redirect. `selector.html` does
+  this correctly.
+
 ## Configuration (env vars)
 
 | Var | Default | Notes |
@@ -65,7 +86,7 @@ routing.
 | `BACKEND_SECONDARY` | *(required)* | Full URL, e.g. `http://oauth2-proxy-secondary` |
 | `LISTEN_ADDR` | `:8080` | |
 | `COOKIE_NAME` | `auth_mode` | |
-| `COOKIE_TEMP_MAX_AGE` | `600` | Seconds a freshly selected, not-yet-proven mode lasts. Must be a positive integer; anything else falls back to the default with a log line. |
+| `COOKIE_TEMP_MAX_AGE` | `900` | Seconds a freshly selected, not-yet-proven mode lasts. Matches oauth2-proxy's default CSRF cookie expiry. Must be a positive integer; anything else falls back to the default with a log line. |
 
 The selector button labels live in [`selector.html`](selector.html) — edit them to
 match your two providers.

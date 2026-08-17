@@ -21,9 +21,12 @@ config:
   cookieName: "auth_mode"
   ## Lifetime (seconds) of the routing cookie right after the user picks a
   ## provider. It is promoted to the full ~1 year only once a request succeeds
-  ## behind that provider, so a wrong choice expires by itself. Keep it long
-  ## enough to complete an interactive login.
-  cookieTempMaxAge: 600
+  ## behind that provider, so a wrong choice expires by itself.
+  ## 900s matches oauth2-proxy's default CSRF cookie expiry (--cookie-csrf-expire
+  ## 15m) — if you changed that, match it here. Expiring mid-login is recoverable
+  ## (the selector reappears on the callback and resumes it), so this does not
+  ## need slack for slow users.
+  cookieTempMaxAge: 900
   backendPrimary: "http://oauth2-proxy-public"
   backendSecondary: "http://oauth2-proxy-private"
 

@@ -187,6 +187,47 @@ func TestTempCookieRoutes(t *testing.T) {
 	}
 }
 
+// The temp cookie can expire while the user is still at the IdP. The login must
+// survive that: the callback arrives with no routing cookie, the gateway serves
+// the selector, and re-selecting the provider must land back on the callback URL
+// with `code`/`state` intact so oauth2-proxy can finish the exchange — the user
+// does not authenticate again.
+func TestExpiredTempCookieMidLoginResumesCallback(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	const callback = "/oauth2/callback?code=abc123&state=xyz789"
+
+	// 1. Callback lands cookieless: selector page, not a 401 and not proxied.
+	req := httptest.NewRequest(http.MethodGet, callback, nil)
+	req.Header.Set("Accept", "text/html")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "SELECTOR") {
+		t.Fatalf("cookieless callback: code=%d body=%q, want the selector page", rec.Code, rec.Body.String())
+	}
+
+	// 2. Re-select with rd = the callback URL, exactly as selector.html encodes it.
+	req = httptest.NewRequest(http.MethodGet, "/.auth/select?mode=primary&rd="+url.QueryEscape(callback), nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != callback {
+		t.Fatalf("location = %q, want %q — the authorization code and state must survive", loc, callback)
+	}
+
+	// 3. With the cookie back, the callback reaches the backend that began the flow.
+	req = httptest.NewRequest(http.MethodGet, callback, nil)
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if got := rec.Body.String(); got != "backend=primary" {
+		t.Fatalf("body = %q, want backend=primary", got)
+	}
+}
+
 func TestPromotionOnSuccess(t *testing.T) {
 	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
