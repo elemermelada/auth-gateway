@@ -69,6 +69,9 @@ func newHandler(cookieName string, selectorHTML []byte, proxies map[string]http.
 		case "/.auth/select":
 			handleSelect(w, r, cookieName)
 			return
+		case "/.auth/reset":
+			handleReset(w, r, cookieName)
+			return
 		}
 
 		// Route by our own cookie. Unknown/absent values are treated as absent.
@@ -132,16 +135,37 @@ func handleSelect(w http.ResponseWriter, r *http.Request, cookieName string) {
 		rd = "/"
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
-		Value:    m,
+	http.SetCookie(w, routingCookie(cookieName, m, cookieMaxAge))
+	http.Redirect(w, r, rd, http.StatusFound)
+}
+
+// handleReset deletes the routing cookie and redirects back to a validated,
+// same-origin relative path (default "/", where the selector page is served).
+// This is the escape hatch from a wrong provider choice.
+func handleReset(w http.ResponseWriter, r *http.Request, cookieName string) {
+	rd := r.URL.Query().Get("rd")
+	if !safeRedirect(rd) {
+		rd = "/"
+	}
+
+	// MaxAge < 0 deletes. Path and the other attributes must match the ones used
+	// when setting it, or the browser keeps the original cookie alongside.
+	http.SetCookie(w, routingCookie(cookieName, "", -1))
+	http.Redirect(w, r, rd, http.StatusFound)
+}
+
+// routingCookie builds the routing cookie with the one canonical set of
+// attributes, so a delete (maxAge < 0) always matches a previously issued cookie.
+func routingCookie(name, value string, maxAge int) *http.Cookie {
+	return &http.Cookie{
+		Name:     name,
+		Value:    value,
 		Path:     "/",
-		MaxAge:   cookieMaxAge,
+		MaxAge:   maxAge,
 		Secure:   true,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-	})
-	http.Redirect(w, r, rd, http.StatusFound)
+	}
 }
 
 // handleNoMode serves the selector page for browser GETs, and a small JSON 401

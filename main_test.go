@@ -169,6 +169,78 @@ func TestSelectOpenRedirectGuard(t *testing.T) {
 	}
 }
 
+func TestResetDeletesCookieAndRedirects(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/.auth/reset?rd=/dashboard", nil)
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/dashboard" {
+		t.Fatalf("location = %q, want /dashboard", loc)
+	}
+	sc := rec.Result().Cookies()
+	if len(sc) != 1 {
+		t.Fatalf("want exactly one Set-Cookie, got %+v", sc)
+	}
+	if sc[0].Name != "auth_mode" || sc[0].MaxAge >= 0 || sc[0].Value != "" {
+		t.Fatalf("cookie not deleted: %+v", sc[0])
+	}
+	// Deletion only takes effect if the attributes match the ones used to set it.
+	if sc[0].Path != "/" || !sc[0].Secure || !sc[0].HttpOnly || sc[0].SameSite != http.SameSiteLaxMode {
+		t.Fatalf("delete cookie attrs don't match the set cookie: %+v", sc[0])
+	}
+}
+
+func TestResetDefaultsToRoot(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/.auth/reset", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/" {
+		t.Fatalf("location = %q, want /", loc)
+	}
+}
+
+func TestResetOpenRedirectGuard(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/.auth/reset?rd=//evil.com/x", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if loc := rec.Header().Get("Location"); loc != "/" {
+		t.Fatalf("open-redirect not blocked: location = %q, want /", loc)
+	}
+}
+
+// Reset must win over cookie-based routing: a user stuck on the wrong backend
+// still needs the endpoint to answer.
+func TestResetHandledEvenWithValidCookie(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/.auth/reset", nil)
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "secondary"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if strings.Contains(rec.Body.String(), "backend=") {
+		t.Fatalf("reset was proxied to a backend: %q", rec.Body.String())
+	}
+}
+
 func TestSafeRedirect(t *testing.T) {
 	cases := map[string]bool{
 		"":                 false,
