@@ -21,7 +21,28 @@ func mustParse(t *testing.T, raw string) *url.URL {
 }
 
 // testCookie is the cookie config used by the test gateway.
-var testCookie = cookieCfg{name: "auth_mode", maxAge: cookieMaxAge, tempMaxAge: 600}
+var testCookie = cookieCfg{name: "auth_mode", maxAge: cookieMaxAge, tempMaxAge: 900}
+
+// testAuth mirrors the production defaults for the oauth2-proxy front door.
+var testAuth = authCfg{
+	pathPrefixes:  splitPrefixes("/oauth2/"),
+	callbackPath:  "/oauth2/callback",
+	sessionCookie: "_oauth2_proxy",
+}
+
+// navGET builds a top-level-navigation GET, the only request shape the auth-error
+// rewrite acts on.
+func navGET(target string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	return req
+}
+
+// setSession writes the split session cookie oauth2-proxy sets on a successful
+// code exchange (_oauth2_proxy_0, never the bare name).
+func setSession(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{Name: "_oauth2_proxy_0", Value: "session-blob", Path: "/"})
+}
 
 // testHandler builds a gateway whose two backends echo their identity, so tests
 // can assert which backend a request was routed to.
@@ -34,8 +55,8 @@ func testHandler(t *testing.T) (http.Handler, func()) {
 		_, _ = io.WriteString(w, "backend=secondary")
 	}))
 	proxies := map[string]http.Handler{
-		"primary":   newProxy(mustParse(t, primary.URL), testCookie),
-		"secondary": newProxy(mustParse(t, secondary.URL), testCookie),
+		"primary":   newProxy(mustParse(t, primary.URL), testCookie, testAuth),
+		"secondary": newProxy(mustParse(t, secondary.URL), testCookie, testAuth),
 	}
 	h := newHandler(testCookie, []byte("<html>SELECTOR</html>"), proxies)
 	return h, func() { primary.Close(); secondary.Close() }
@@ -46,7 +67,7 @@ func testHandler(t *testing.T) (http.Handler, func()) {
 func testGatewayTo(t *testing.T, backend http.HandlerFunc) (http.Handler, func()) {
 	t.Helper()
 	srv := httptest.NewServer(backend)
-	proxies := map[string]http.Handler{"primary": newProxy(mustParse(t, srv.URL), testCookie)}
+	proxies := map[string]http.Handler{"primary": newProxy(mustParse(t, srv.URL), testCookie, testAuth)}
 	return newHandler(testCookie, []byte("<html>SELECTOR</html>"), proxies), srv.Close
 }
 
@@ -228,13 +249,18 @@ func TestExpiredTempCookieMidLoginResumesCallback(t *testing.T) {
 	}
 }
 
-func TestPromotionOnSuccess(t *testing.T) {
-	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
+// successfulCallback is what oauth2-proxy answers when the code exchange worked:
+// a 302 onward with the session cookie attached. That is the promotion signal.
+func successfulCallback(w http.ResponseWriter, r *http.Request) {
+	setSession(w)
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func TestPromotionOnSuccessfulCallback(t *testing.T) {
+	h, cleanup := testGatewayTo(t, successfulCallback)
 	defer cleanup()
 
-	req := httptest.NewRequest(http.MethodGet, "/app", nil)
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/callback?code=x&state=y", nil)
 	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -248,13 +274,31 @@ func TestPromotionOnSuccess(t *testing.T) {
 	}
 }
 
-func TestNoPromotionOnAuthFailure(t *testing.T) {
-	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+// A 302 off the callback without a session cookie is a failed exchange (or a
+// bounce back to the sign-in page) — the choice is not proven.
+func TestNoPromotionOnCallbackWithoutSession(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/oauth2/sign_in", http.StatusFound)
+	})
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/callback?code=x", nil)
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if c := routingCookieOf(t, rec); c != nil {
+		t.Fatalf("sessionless callback promoted the cookie: %+v", c)
+	}
+}
+
+func TestNoPromotionOnCallbackFailure(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError} {
 		h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(status)
 		})
 
-		req := httptest.NewRequest(http.MethodGet, "/app", nil)
+		req := navGET("/oauth2/callback?code=x")
 		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -266,32 +310,32 @@ func TestNoPromotionOnAuthFailure(t *testing.T) {
 	}
 }
 
-// oauth2-proxy serves its own sign-in page with 200 under /oauth2/, which proves
-// nothing about the user being able to sign in — it must not promote.
-func TestNoPromotionOnAuthPath(t *testing.T) {
+// A plain 2xx from the app used to promote. It no longer does: only the callback
+// proves the choice, so an app that answers 200 to anonymous requests (or any
+// backend quirk) can't lock in a provider the user can't actually sign in to.
+func TestNoPromotionOnAppSuccess(t *testing.T) {
 	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	defer cleanup()
-
-	req := httptest.NewRequest(http.MethodGet, "/oauth2/sign_in", nil)
-	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if c := routingCookieOf(t, rec); c != nil {
-		t.Fatalf("/oauth2/ 200 promoted the cookie: %+v", c)
-	}
-}
-
-// An already-promoted cookie must not be re-set on every proxied request.
-func TestNoRepromotionOfFullCookie(t *testing.T) {
-	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		setSession(w) // even with a session cookie in play
 		w.WriteHeader(http.StatusOK)
 	})
 	defer cleanup()
 
 	req := httptest.NewRequest(http.MethodGet, "/app", nil)
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if c := routingCookieOf(t, rec); c != nil {
+		t.Fatalf("2xx on an app path promoted the cookie: %+v", c)
+	}
+}
+
+// An already-promoted cookie must not be re-set on every proxied request.
+func TestNoRepromotionOfFullCookie(t *testing.T) {
+	h, cleanup := testGatewayTo(t, successfulCallback)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/callback?code=x", nil)
 	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -304,12 +348,12 @@ func TestNoRepromotionOfFullCookie(t *testing.T) {
 // oauth2-proxy answering 403 with its sign-in error page is the dead end users
 // got stuck on; it must become a redirect to /.auth/reset.
 func TestAuthErrorRewrittenToReset(t *testing.T) {
-	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError} {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "sign-in failed", status)
 		})
 
-		req := httptest.NewRequest(http.MethodGet, "/oauth2/callback?code=x", nil)
+		req := navGET("/oauth2/callback?code=x")
 		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -324,6 +368,69 @@ func TestAuthErrorRewrittenToReset(t *testing.T) {
 			t.Errorf("backend %d: error page leaked through: %q", status, body)
 		}
 		cleanup()
+	}
+}
+
+// A 500 is oauth2-proxy's own breakage, not a wrong-provider dead end. Showing
+// the real error beats hiding it behind a reset — and the temp cookie expires on
+// its own, so a reload still lands on the selector.
+func TestAuthError500PassesThrough(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal oauth2-proxy failure", http.StatusInternalServerError)
+	})
+	defer cleanup()
+
+	req := navGET("/oauth2/callback?code=x")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 passed through", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "internal oauth2-proxy failure") {
+		t.Fatalf("error page not preserved: %q", rec.Body.String())
+	}
+}
+
+// An XHR/fetch to /oauth2/* must keep its raw 401/403. Rewriting it would drag a
+// background request through /.auth/reset and silently drop the routing cookie
+// under a page that is still running.
+func TestAuthErrorNotRewrittenForNonNavigation(t *testing.T) {
+	for _, mode := range []string{"cors", "no-cors", "same-origin"} {
+		h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "sign-in failed", http.StatusForbidden)
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/oauth2/auth", nil)
+		req.Header.Set("Sec-Fetch-Mode", mode)
+		req.Header.Set("Accept", "text/html") // must not override Sec-Fetch-Mode
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("Sec-Fetch-Mode=%s: status = %d, want 403 passed through", mode, rec.Code)
+		}
+		cleanup()
+	}
+}
+
+// Old clients send no Sec-Fetch-Mode; Accept: text/html is the navigation proxy.
+func TestAuthErrorRewrittenForLegacyHTMLRequest(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "sign-in failed", http.StatusForbidden)
+	})
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/callback?code=x", nil)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/.auth/reset?rd=/" {
+		t.Fatalf("legacy navigation not rewritten: code=%d loc=%q", rec.Code, rec.Header().Get("Location"))
 	}
 }
 
@@ -486,6 +593,87 @@ func TestResetHandledEvenWithValidCookie(t *testing.T) {
 	}
 }
 
+// A cross-site GET to /.auth/reset (an <img>/<iframe> on someone else's page)
+// must not be able to clear the routing cookie. The redirect still happens —
+// the endpoint stays GET-reachable for the error rewrite — but the cookie stays.
+func TestResetIgnoresCrossSiteRequest(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	for _, site := range []string{"cross-site", "same-site"} {
+		req := httptest.NewRequest(http.MethodGet, "/.auth/reset", nil)
+		req.Header.Set("Sec-Fetch-Site", site)
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusFound {
+			t.Errorf("Sec-Fetch-Site=%s: status = %d, want 302", site, rec.Code)
+		}
+		if c := routingCookieOf(t, rec); c != nil {
+			t.Errorf("Sec-Fetch-Site=%s: cookie was cleared cross-site: %+v", site, c)
+		}
+	}
+}
+
+func TestResetAllowedForSameOriginAndDirectNavigation(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	// "none" = typed in the URL bar; "" = old client that sends no Sec-Fetch-Site.
+	for _, site := range []string{"same-origin", "none", ""} {
+		req := httptest.NewRequest(http.MethodGet, "/.auth/reset", nil)
+		if site != "" {
+			req.Header.Set("Sec-Fetch-Site", site)
+		}
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		c := routingCookieOf(t, rec)
+		if c == nil || c.MaxAge >= 0 {
+			t.Errorf("Sec-Fetch-Site=%q: cookie not deleted: %+v", site, c)
+		}
+	}
+}
+
+func TestIsAuthPath(t *testing.T) {
+	cases := map[string]bool{
+		"/oauth2/":          true,
+		"/oauth2":           true,
+		"/oauth2/callback":  true,
+		"/oauth2/sign_in":   true,
+		"/app":              false,
+		"/":                 false,
+		"/oauth2-app/thing": false, // prefix must not match a sibling path
+		// Traversal must be resolved before classifying, in both directions.
+		"/oauth2/../app":      false,
+		"/app/../oauth2/auth": true,
+		"//oauth2//callback":  true,
+	}
+	for in, want := range cases {
+		if got := testAuth.isAuthPath(in); got != want {
+			t.Errorf("isAuthPath(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// A multi-prefix front door (e.g. oauth2-proxy plus a custom sign-in route).
+func TestIsAuthPathMultiplePrefixes(t *testing.T) {
+	a := authCfg{pathPrefixes: splitPrefixes(" /oauth2/ , /auth ")}
+	for in, want := range map[string]bool{
+		"/oauth2/start": true,
+		"/auth/login":   true,
+		"/auth":         true,
+		"/authorize":    false,
+		"/app":          false,
+	} {
+		if got := a.isAuthPath(in); got != want {
+			t.Errorf("isAuthPath(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
 func TestSafeRedirect(t *testing.T) {
 	cases := map[string]bool{
 		"":                 false,
@@ -534,7 +722,7 @@ func TestWebSocketUpgradeProxied(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	proxies := map[string]http.Handler{"primary": newProxy(mustParse(t, backend.URL), testCookie)}
+	proxies := map[string]http.Handler{"primary": newProxy(mustParse(t, backend.URL), testCookie, testAuth)}
 	gw := httptest.NewServer(newHandler(testCookie, nil, proxies))
 	defer gw.Close()
 
@@ -586,7 +774,7 @@ func TestProxyPreservesHostAndSetsXForwarded(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	p := newProxy(mustParse(t, backend.URL), testCookie)
+	p := newProxy(mustParse(t, backend.URL), testCookie, testAuth)
 	req := httptest.NewRequest(http.MethodGet, "http://app.example.com/x", nil)
 	req.RemoteAddr = "203.0.113.7:12345"
 	rec := httptest.NewRecorder()

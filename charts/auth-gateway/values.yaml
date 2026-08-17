@@ -27,6 +27,18 @@ config:
   ## (the selector reappears on the callback and resumes it), so this does not
   ## need slack for slow users.
   cookieTempMaxAge: 900
+  ## The auth front door's own surface. Defaults describe oauth2-proxy; change
+  ## them only if you put a different front door behind the gateway or moved
+  ## oauth2-proxy's --proxy-prefix.
+  ## authPathPrefixes: comma-separated; scopes the auth-error rewrite so app 4xx
+  ## responses are never touched.
+  authPathPrefixes: "/oauth2/"
+  ## authCallbackPath + authSessionCookie: a 302 off the callback that also sets
+  ## the session cookie is what promotes the routing cookie to its full lifetime.
+  ## The cookie name is matched as a prefix (oauth2-proxy splits large sessions
+  ## into _oauth2_proxy_0, _1, …).
+  authCallbackPath: "/oauth2/callback"
+  authSessionCookie: "_oauth2_proxy"
   backendPrimary: "http://oauth2-proxy-public"
   backendSecondary: "http://oauth2-proxy-private"
 

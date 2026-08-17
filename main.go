@@ -15,6 +15,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +41,21 @@ type cookieCfg struct {
 	tempMaxAge int
 }
 
+// authCfg describes the auth front-door sitting behind the gateway. The defaults
+// are oauth2-proxy's, but nothing here is hardcoded to it — any front door that
+// owns a path prefix and sets a session cookie on its callback works.
+type authCfg struct {
+	// pathPrefixes are the front door's own endpoints (sign-in, callback,
+	// sign-out), normalized without a trailing slash.
+	pathPrefixes []string
+	// callbackPath is the exact path the IdP redirects back to.
+	callbackPath string
+	// sessionCookie is the name prefix of the cookie the front door sets once a
+	// session exists. A prefix, because oauth2-proxy splits large sessions into
+	// _oauth2_proxy_0, _1, ….
+	sessionCookie string
+}
+
 func main() {
 	var (
 		listenAddr       = env("LISTEN_ADDR", ":8080")
@@ -52,6 +68,11 @@ func main() {
 			// in-flight login can't complete anyway, so a longer window buys nothing.
 			tempMaxAge: envInt("COOKIE_TEMP_MAX_AGE", 900),
 		}
+		auth = authCfg{
+			pathPrefixes:  envPrefixes("AUTH_PATH_PREFIXES", "/oauth2/"),
+			callbackPath:  cleanPath(env("AUTH_CALLBACK_PATH", "/oauth2/callback")),
+			sessionCookie: env("AUTH_SESSION_COOKIE", "_oauth2_proxy"),
+		}
 	)
 
 	selectorHTML, err := selectorFS.ReadFile("selector.html")
@@ -60,8 +81,8 @@ func main() {
 	}
 
 	proxies := map[string]http.Handler{
-		"primary":   newProxy(backendPrimary, cookie),
-		"secondary": newProxy(backendSecondary, cookie),
+		"primary":   newProxy(backendPrimary, cookie, auth),
+		"secondary": newProxy(backendSecondary, cookie, auth),
 	}
 
 	srv := &http.Server{
@@ -73,8 +94,9 @@ func main() {
 		// long-lived WebSocket / SSE / long-polling connections.
 	}
 
-	log.Printf("auth-gateway listening on %s (primary=%s secondary=%s cookie=%s temp_max_age=%ds)",
-		listenAddr, backendPrimary, backendSecondary, cookie.name, cookie.tempMaxAge)
+	log.Printf("auth-gateway listening on %s (primary=%s secondary=%s cookie=%s temp_max_age=%ds auth_paths=%s callback=%s session_cookie=%s)",
+		listenAddr, backendPrimary, backendSecondary, cookie.name, cookie.tempMaxAge,
+		strings.Join(auth.pathPrefixes, ","), auth.callbackPath, auth.sessionCookie)
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -108,13 +130,13 @@ func newHandler(cookie cookieCfg, selectorHTML []byte, proxies map[string]http.H
 // newProxy builds a reverse proxy to a single backend, tuned for lossless
 // streaming and WebSocket upgrades. httputil.ReverseProxy natively hijacks and
 // bidirectionally copies Upgrade connections, so no websocket library is needed.
-func newProxy(target *url.URL, cookie cookieCfg) *httputil.ReverseProxy {
+func newProxy(target *url.URL, cookie cookieCfg, auth authCfg) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		ModifyResponse: func(resp *http.Response) error {
-			if rewriteAuthError(resp) {
+			if rewriteAuthError(resp, auth) {
 				return nil
 			}
-			promoteCookie(resp, cookie)
+			promoteCookie(resp, cookie, auth)
 			return nil
 		},
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -162,15 +184,18 @@ func cookieMode(r *http.Request, cookieName string) (m string, temp bool) {
 }
 
 // promoteCookie upgrades a still-temporary routing cookie to its full lifetime
-// once the backend proves the choice was right, i.e. it answered 2xx on a
-// non-auth path (behind oauth2-proxy that means the session is authenticated).
-// /oauth2/* is excluded: oauth2-proxy serves its own sign-in page with 200 there,
-// which says nothing about whether the user can actually get in.
-func promoteCookie(resp *http.Response, cookie cookieCfg) {
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+// once the auth front door proves the choice was right: a 302 off the callback
+// path that also sets the session cookie. That combination only happens when the
+// code exchange succeeded — a failed callback answers 4xx/5xx and sets no
+// session — so no wrong choice is ever promoted.
+func promoteCookie(resp *http.Response, cookie cookieCfg, auth authCfg) {
+	if resp.StatusCode != http.StatusFound {
 		return
 	}
-	if resp.Request == nil || isAuthPath(resp.Request.URL.Path) {
+	if resp.Request == nil || cleanPath(resp.Request.URL.Path) != auth.callbackPath {
+		return
+	}
+	if !setsSessionCookie(resp, auth.sessionCookie) {
 		return
 	}
 	m, temp := cookieMode(resp.Request, cookie.name)
@@ -180,20 +205,44 @@ func promoteCookie(resp *http.Response, cookie cookieCfg) {
 	resp.Header.Add("Set-Cookie", routingCookie(cookie.name, m, cookie.maxAge).String())
 }
 
+// setsSessionCookie reports whether the response sets the front door's session
+// cookie. Matched by prefix: oauth2-proxy splits sessions too large for one
+// cookie into _oauth2_proxy_0, _oauth2_proxy_1, … and never sets the bare name.
+func setsSessionCookie(resp *http.Response, name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, c := range resp.Cookies() {
+		if strings.HasPrefix(c.Name, name) && c.Value != "" && c.MaxAge >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // rewriteAuthError turns oauth2-proxy's own failure responses into a redirect to
 // /.auth/reset, so a user who picked the wrong IdP lands back on the selector
 // instead of on a dead sign-in error page. It reports whether it rewrote.
 //
-// Loop guard: this only fires on oauth2-proxy's own endpoints (/oauth2/*), never
-// on application 4xx responses, and /.auth/reset is served by the gateway itself
-// (never proxied) and clears the cookie — so the next request hits the selector.
-func rewriteAuthError(resp *http.Response) bool {
-	if resp.Request == nil || !isAuthPath(resp.Request.URL.Path) {
+// It is deliberately narrow:
+//   - Only the front door's own endpoints (AUTH_PATH_PREFIXES), never application
+//     4xx responses. /.auth/reset is served by the gateway itself (never proxied)
+//     and clears the cookie, so this cannot loop.
+//   - Only 401/403. A 500 passes through so the user sees the real error page;
+//     the temp cookie expires by itself, and a reload lands on the selector.
+//   - Only top-level navigations. An XHR to /oauth2/* keeps its raw 401/403
+//     instead of being dragged through /.auth/reset and silently losing the
+//     routing cookie under a page that is still running.
+func rewriteAuthError(resp *http.Response, auth authCfg) bool {
+	if resp.Request == nil || !auth.isAuthPath(resp.Request.URL.Path) {
 		return false
 	}
 	switch resp.StatusCode {
-	case http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError:
+	case http.StatusUnauthorized, http.StatusForbidden:
 	default:
+		return false
+	}
+	if !isNavigation(resp.Request) {
 		return false
 	}
 
@@ -210,10 +259,54 @@ func rewriteAuthError(resp *http.Response) bool {
 	return true
 }
 
-// isAuthPath reports whether a path belongs to oauth2-proxy's own endpoints
-// (sign-in page, callback, sign-out) rather than to the application.
-func isAuthPath(path string) bool {
-	return strings.HasPrefix(path, "/oauth2/")
+// isAuthPath reports whether a path belongs to the auth front door's own
+// endpoints (sign-in page, callback, sign-out) rather than to the application.
+// The path is cleaned first, so "/oauth2/../app" is classified as the app path
+// it actually resolves to.
+func (a authCfg) isAuthPath(p string) bool {
+	p = cleanPath(p)
+	for _, prefix := range a.pathPrefixes {
+		if p == prefix || strings.HasPrefix(p, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// cleanPath normalizes a request path (resolving "." / ".." and duplicate
+// slashes) so prefix and equality matches can't be skewed by traversal segments.
+// It always returns a rooted path.
+func cleanPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	return path.Clean(p)
+}
+
+// isNavigation reports whether a request is a top-level browser navigation, the
+// only case where turning a response into a redirect makes sense. Sec-Fetch-Mode
+// is authoritative where present; older clients fall back to the Accept header.
+func isNavigation(r *http.Request) bool {
+	if m := r.Header.Get("Sec-Fetch-Mode"); m != "" {
+		return m == "navigate"
+	}
+	return strings.Contains(r.Header.Get("Accept"), "text/html")
+}
+
+// sameOriginRequest reports whether a request plausibly originated from our own
+// site, used as the CSRF guard on /.auth/reset. Sec-Fetch-Site is sent by every
+// current browser; when it's absent (old clients, non-browser agents) we allow,
+// since the endpoint has to stay reachable by a plain GET.
+func sameOriginRequest(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+		return true
+	default:
+		return false
+	}
 }
 
 // handleSelect sets the routing cookie and redirects back to a validated,
@@ -240,15 +333,22 @@ func handleSelect(w http.ResponseWriter, r *http.Request, cookie cookieCfg) {
 // handleReset deletes the routing cookie and redirects back to a validated,
 // same-origin relative path (default "/", where the selector page is served).
 // This is the escape hatch from a wrong provider choice.
+//
+// It stays a GET on purpose — the auth-error rewrite needs a reset reachable by
+// redirect — so cross-site requests are neutered instead of being made
+// impossible: a third-party page embedding /.auth/reset still gets its redirect,
+// but the cookie survives, so it can't log the user out of their provider choice.
 func handleReset(w http.ResponseWriter, r *http.Request, cookie cookieCfg) {
 	rd := r.URL.Query().Get("rd")
 	if !safeRedirect(rd) {
 		rd = "/"
 	}
 
-	// MaxAge < 0 deletes. Path and the other attributes must match the ones used
-	// when setting it, or the browser keeps the original cookie alongside.
-	http.SetCookie(w, routingCookie(cookie.name, "", -1))
+	if sameOriginRequest(r) {
+		// MaxAge < 0 deletes. Path and the other attributes must match the ones used
+		// when setting it, or the browser keeps the original cookie alongside.
+		http.SetCookie(w, routingCookie(cookie.name, "", -1))
+	}
 	http.Redirect(w, r, rd, http.StatusFound)
 }
 
@@ -304,6 +404,31 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envPrefixes reads a comma-separated path-prefix list, falling back to def when
+// unset or empty. Entries are normalized to a rooted, trailing-slash-free form so
+// a prefix matches both the path itself and everything below it (and "/oauth2"
+// can never match "/oauth2-app").
+func envPrefixes(key, def string) []string {
+	raw := env(key, def)
+	out := splitPrefixes(raw)
+	if len(out) == 0 {
+		log.Printf("%s = %q has no usable prefixes, using %q", key, raw, def)
+		out = splitPrefixes(def)
+	}
+	return out
+}
+
+func splitPrefixes(raw string) []string {
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		out = append(out, strings.TrimSuffix(cleanPath(p), "/"))
+	}
+	return out
 }
 
 // envInt reads a positive integer env var, falling back to def when unset,

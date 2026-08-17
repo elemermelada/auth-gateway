@@ -20,9 +20,9 @@ ingress ──► auth-gateway ──┬─► oauth2-proxy-primary    ──►
 | No/unknown cookie + `GET` with `Accept: text/html` | `200` embedded selector page (two buttons) |
 | No/unknown cookie + anything else | `401` with small JSON body |
 | `GET /.auth/select?mode=<primary\|secondary>&rd=<path>` | Set cookie (short-lived, see below), `302` to `rd` (open-redirect–guarded; defaults to `/`) |
-| `GET /.auth/reset?rd=<path>` | **Delete** the cookie, `302` to `rd` (same guard, defaults to `/` → selector page) |
+| `GET /.auth/reset?rd=<path>` | **Delete** the cookie, `302` to `rd` (same guard, defaults to `/` → selector page). Cross-site requests get the redirect but keep the cookie |
 | `GET /healthz` | `200` (liveness/readiness) |
-| Backend returns `401`/`403`/`500` on one of its own `/oauth2/*` endpoints | `302` to `/.auth/reset?rd=/` |
+| Backend returns `401`/`403` on one of its own auth endpoints (`/oauth2/*`), **on a navigation** | `302` to `/.auth/reset?rd=/` |
 
 There is **no mode-switch endpoint** by design — a stale oauth2-proxy session
 cookie after a manual switch just re-triggers login. To change provider, hit
@@ -38,21 +38,40 @@ Three mechanisms make it recoverable:
    was set with, so the deletion actually matches) and sends the user back to the
    selector. This is the manual escape hatch; link it from your app as
    *"wrong provider? start over"* → `/.auth/reset?rd=/`.
-2. **Two-stage cookie lifetime.** `/.auth/select` issues the cookie with
-   `COOKIE_TEMP_MAX_AGE` (default `600`s) and the value marked `<mode>:tmp`. The
-   moment the backend answers `2xx` on a **non-`/oauth2/`** path — behind
-   oauth2-proxy that means the session is authenticated — the gateway re-issues
-   the cookie unmarked with the full ~1 year lifetime. So an unproven choice
-   expires on its own in minutes, a proven one stays sticky. The marker also
-   keeps the gateway from re-setting the cookie on every request. `/oauth2/*` is
-   excluded from promotion because oauth2-proxy serves its own sign-in page there
-   with a `200`.
-3. **Auto-redirect on auth error.** A `401`/`403`/`500` from an `/oauth2/*`
-   endpoint (oauth2-proxy's sign-in error page) is rewritten to a `302` to
-   `/.auth/reset?rd=/`, so the dead end becomes a fresh selection. This is scoped
-   to `/oauth2/*` so **application** 4xx responses pass through untouched, and it
-   cannot loop: `/.auth/reset` is served by the gateway itself and clears the
-   cookie.
+
+   It stays a plain `GET` (mechanism 3 needs a reset reachable by redirect), so
+   cross-site abuse is neutered rather than blocked: if `Sec-Fetch-Site` says
+   `cross-site`/`same-site`, the redirect still happens but the cookie is left
+   alone. Absent header (old clients, curl) is allowed.
+2. **Two-stage cookie lifetime, promoted by the callback.** `/.auth/select`
+   issues the cookie with `COOKIE_TEMP_MAX_AGE` (default `900`s) and the value
+   marked `<mode>:tmp`. It is promoted to the full ~1 year exactly when the auth
+   front door proves the choice: a **`302` off `AUTH_CALLBACK_PATH` that also
+   sets `AUTH_SESSION_COOKIE`**. That pair only occurs when the code exchange
+   succeeded — a failed callback answers `4xx`/`5xx` and sets no session — so a
+   provider the user can't actually sign in to is *never* promoted. The `:tmp`
+   marker also keeps the gateway from re-setting the cookie on every request.
+
+   The session cookie is matched by **name prefix**, because oauth2-proxy splits
+   sessions too large for one cookie into `_oauth2_proxy_0`, `_1`, … and never
+   sets the bare name.
+3. **Auto-redirect on auth error.** A `401`/`403` from an auth-path endpoint
+   (oauth2-proxy's sign-in error page) is rewritten to a `302` to
+   `/.auth/reset?rd=/`, so the dead end becomes a fresh selection. It is
+   deliberately narrow:
+   - scoped to `AUTH_PATH_PREFIXES`, so **application** 4xx responses pass
+     through untouched — and it cannot loop, since `/.auth/reset` is served by
+     the gateway itself and clears the cookie;
+   - `500` passes through, so the user sees oauth2-proxy's real error instead of
+     a reset that hides it. Nothing is lost: the temp cookie expires by itself
+     and a reload lands on the selector;
+   - only on top-level navigations (`Sec-Fetch-Mode: navigate`, falling back to
+     `Accept: text/html` for old clients). A background XHR to `/oauth2/auth`
+     keeps its raw `401`/`403` instead of being dragged through `/.auth/reset`
+     and silently dropping the routing cookie under a live page.
+
+Auth paths are classified on the **cleaned** request path, so
+`/oauth2/../app` is treated as the app path it actually resolves to.
 
 Both `<mode>` and `<mode>:tmp` route identically, so the marker is invisible to
 routing.
@@ -71,7 +90,8 @@ Two consequences worth knowing:
 - `COOKIE_TEMP_MAX_AGE` doesn't need slack for slow users. The real deadline is
   oauth2-proxy's CSRF cookie (`--cookie-csrf-expire`, 15m by default) and the
   IdP's authorization-code lifetime; once those lapse the resumed callback gets a
-  `403`, which the gateway turns into `/.auth/reset?rd=/` for a clean restart.
+  `403`, which the gateway turns into `/.auth/reset?rd=/` for a clean restart
+  (it's a navigation, so the rewrite applies).
   Hence the `900`s default.
 - Anything hand-building a `/.auth/select` link must **URL-encode `rd`**
   (`encodeURIComponent`), or `&state=…` is parsed as a parameter of
@@ -87,6 +107,13 @@ Two consequences worth knowing:
 | `LISTEN_ADDR` | `:8080` | |
 | `COOKIE_NAME` | `auth_mode` | |
 | `COOKIE_TEMP_MAX_AGE` | `900` | Seconds a freshly selected, not-yet-proven mode lasts. Matches oauth2-proxy's default CSRF cookie expiry. Must be a positive integer; anything else falls back to the default with a log line. |
+| `AUTH_PATH_PREFIXES` | `/oauth2/` | Comma-separated path prefixes owned by the auth front door. Used to scope the error rewrite and to keep the front door's own endpoints out of the app's namespace. Each entry matches the path itself and everything below it, so `/oauth2` never matches `/oauth2-app`. |
+| `AUTH_CALLBACK_PATH` | `/oauth2/callback` | Exact path the IdP redirects back to. A `302` here that sets the session cookie is the promotion signal. |
+| `AUTH_SESSION_COOKIE` | `_oauth2_proxy` | Name **prefix** of the front door's session cookie (oauth2-proxy splits large sessions into `_oauth2_proxy_0`, `_1`, …). |
+
+The three `AUTH_*` vars are what keep the gateway generic: the defaults describe
+oauth2-proxy, but any front door that owns a path prefix and sets a session
+cookie on its callback works by pointing them elsewhere.
 
 The selector button labels live in [`selector.html`](selector.html) — edit them to
 match your two providers.
@@ -151,7 +178,8 @@ helm install auth-gateway ./charts/auth-gateway \
 - **Config is passed as env vars.** Everything under `config.*` in
   [`values.yaml`](charts/auth-gateway/values.yaml) is rendered into the
   container's `env` (`BACKEND_PRIMARY`, `BACKEND_SECONDARY`, `LISTEN_ADDR`,
-  `COOKIE_NAME`, `COOKIE_TEMP_MAX_AGE`). `backendPrimary` / `backendSecondary` are **required** — the
+  `COOKIE_NAME`, `COOKIE_TEMP_MAX_AGE`, `AUTH_PATH_PREFIXES`,
+  `AUTH_CALLBACK_PATH`, `AUTH_SESSION_COOKIE`). `backendPrimary` / `backendSecondary` are **required** — the
   chart fails to render (`helm template`/`install` errors) if they're unset, so
   a misconfigured gateway can't reach the cluster. Point them at the two
   oauth2-proxy Services.
