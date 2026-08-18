@@ -1,4 +1,13 @@
 <!doctype html>
+<!--
+  The default selector shell. Everything here is cosmetic: the buttons and the
+  script that preserves the original destination are spliced in by the gateway at
+  the AUTH_GATEWAY_SELECTOR placeholder below.
+
+  A custom page (SELECTOR_HTML_FILE / SELECTOR_HTML) is a shell just like this
+  one: one self-contained document, styling the widget through the ag-* classes.
+  See README: "Custom selector page".
+-->
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -21,20 +30,20 @@
     }
     h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
     p { margin: 0 0 1.5rem; color: #666; font-size: .9rem; }
-    .btns { display: grid; gap: .75rem; }
-    a.btn {
+    .ag-options { display: grid; gap: .75rem; }
+    a.ag-btn {
       display: block; padding: .85rem 1rem; border-radius: 8px;
       text-decoration: none; font-weight: 600; font-size: 1rem;
       border: 1px solid transparent; transition: filter .1s;
     }
-    a.btn:hover { filter: brightness(.95); }
-    .primary { background: #2b5cff; color: #fff; }
-    .secondary { background: #eef1f6; color: #1a1a1a; border-color: #d6dae2; }
+    a.ag-btn:hover { filter: brightness(.95); }
+    .ag-btn-primary { background: #2b5cff; color: #fff; }
+    .ag-btn-secondary { background: #eef1f6; color: #1a1a1a; border-color: #d6dae2; }
     @media (prefers-color-scheme: dark) {
       body { background: #12141a; color: #e9eaed; }
       .card { background: #1c1f27; box-shadow: 0 6px 24px rgba(0,0,0,.4); }
       p { color: #9aa0ac; }
-      .secondary { background: #262a34; color: #e9eaed; border-color: #333947; }
+      .ag-btn-secondary { background: #262a34; color: #e9eaed; border-color: #333947; }
     }
   </style>
 </head>
@@ -42,16 +51,7 @@
   <main class="card">
     <h1>Choose sign-in</h1>
     <p>Select how you want to authenticate to continue.</p>
-    <div class="btns">
-      <a id="primary" class="btn primary" href="/.auth/select?mode=primary">Primary</a>
-      <a id="secondary" class="btn secondary" href="/.auth/select?mode=secondary">Secondary</a>
-    </div>
+    <!--AUTH_GATEWAY_SELECTOR-->
   </main>
-  <script>
-    // Preserve where the user was headed so /.auth/select can redirect back.
-    var rd = encodeURIComponent(location.pathname + location.search);
-    document.getElementById('primary').href = '/.auth/select?mode=primary&rd=' + rd;
-    document.getElementById('secondary').href = '/.auth/select?mode=secondary&rd=' + rd;
-  </script>
 </body>
 </html>
