@@ -1,6 +1,6 @@
 // Command auth-gateway is a tiny cookie-based mode selector that sits between the
-// ingress and two oauth2-proxy instances. It routes every request to a backend
-// based on its own routing cookie (auth_mode), and serves a selector page
+// ingress and any number of oauth2-proxy instances. It routes every request to a
+// backend based on its own routing cookie (auth_mode), and serves a selector page
 // when no valid mode has been chosen yet.
 //
 // Design goals: stdlib only, stateless, and lossless proxying for WebSockets,
@@ -147,6 +147,16 @@ func modeSet(backends []backend) map[string]bool {
 	return set
 }
 
+// describeBackends renders the backend list for the startup log line, in config
+// (button) order, so an unexpected routing target is auditable from the logs.
+func describeBackends(backends []backend) string {
+	parts := make([]string, 0, len(backends))
+	for _, b := range backends {
+		parts = append(parts, b.key+"="+b.url.String())
+	}
+	return strings.Join(parts, ",")
+}
+
 // checkLegacyBackendVars rejects a deploy that still sets the removed
 // BACKEND_PRIMARY / BACKEND_SECONDARY vars. Ignoring them silently would start a
 // gateway with no backends at all (or with the wrong ones) and show every user
@@ -170,6 +180,10 @@ type cookieCfg struct {
 	// tempMaxAge is the short lifetime a fresh selection gets, so a wrong choice
 	// expires on its own instead of sticking for a year.
 	tempMaxAge int
+	// modes is the set of accepted cookie values: exactly the configured backend
+	// keys. It lives here because every place that reads or writes the routing
+	// cookie needs to know which values are real.
+	modes map[string]bool
 }
 
 // authCfg describes the auth front door sitting behind the gateway.
@@ -201,16 +215,23 @@ type selectorPage struct {
 }
 
 func main() {
+	if err := checkLegacyBackendVars(); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	backends, err := parseBackends(os.Getenv("BACKENDS"), os.Getenv("BACKEND_LABELS"))
+	if err != nil {
+		log.Fatalf("BACKENDS: %v", err)
+	}
+
 	var (
-		listenAddr       = env("LISTEN_ADDR", ":8080")
-		backendPrimary   = mustURL("BACKEND_PRIMARY")
-		backendSecondary = mustURL("BACKEND_SECONDARY")
-		cookie           = cookieCfg{
+		listenAddr = env("LISTEN_ADDR", ":8080")
+		cookie     = cookieCfg{
 			name:       env("COOKIE_NAME", "auth_mode"),
 			maxAge:     cookieMaxAge,
 			// 15m matches oauth2-proxy's default CSRF cookie expiry: past that the
 			// in-flight login can't complete anyway, so a longer window buys nothing.
 			tempMaxAge: envInt("COOKIE_TEMP_MAX_AGE", 900),
+			modes:      modeSet(backends),
 		}
 		auth = authCfg{
 			pathPrefixes:  envPrefixes("AUTH_PATH_PREFIXES", "/oauth2/"),
@@ -226,9 +247,9 @@ func main() {
 		log.Fatalf("selector: %v", err)
 	}
 
-	proxies := map[string]http.Handler{
-		"primary":   newProxy(backendPrimary, cookie, auth),
-		"secondary": newProxy(backendSecondary, cookie, auth),
+	proxies := make(map[string]http.Handler, len(backends))
+	for _, b := range backends {
+		proxies[b.key] = newProxy(b.url, cookie, auth)
 	}
 
 	srv := &http.Server{
@@ -240,8 +261,8 @@ func main() {
 		// long-lived WebSocket / SSE / long-polling connections.
 	}
 
-	log.Printf("auth-gateway listening on %s (primary=%s secondary=%s cookie=%s temp_max_age=%ds auth_paths=%s callback=%s session_cookie=%s selector=%s sha256=%s)",
-		listenAddr, backendPrimary, backendSecondary, cookie.name, cookie.tempMaxAge,
+	log.Printf("auth-gateway listening on %s (backends=%s cookie=%s temp_max_age=%ds auth_paths=%s callback=%s session_cookie=%s selector=%s sha256=%s)",
+		listenAddr, describeBackends(backends), cookie.name, cookie.tempMaxAge,
 		strings.Join(auth.pathPrefixes, ","), auth.callbackPath, auth.sessionCookie,
 		sel.source, sel.sha256)
 	log.Fatal(srv.ListenAndServe())
@@ -371,7 +392,7 @@ func newHandler(cookie cookieCfg, sel selectorPage, proxies map[string]http.Hand
 		}
 
 		// Route by our own cookie. Unknown/absent values are treated as absent.
-		if p := proxies[mode(r, cookie.name)]; p != nil {
+		if p := proxies[mode(r, cookie)]; p != nil {
 			p.ServeHTTP(w, r)
 			return
 		}
@@ -410,16 +431,18 @@ func newProxy(target *url.URL, cookie cookieCfg, auth authCfg) *httputil.Reverse
 
 // mode returns the validated routing mode from the cookie, or "" if the cookie
 // is missing or holds an unrecognized value (never an error path).
-func mode(r *http.Request, cookieName string) string {
-	m, _ := cookieMode(r, cookieName)
+func mode(r *http.Request, cookie cookieCfg) string {
+	m, _ := cookieMode(r, cookie)
 	return m
 }
 
 // cookieMode returns the validated routing mode plus whether the cookie is still
 // the short-lived variant issued at selection time (value suffixed with
-// tempSuffix, e.g. "primary:tmp"). Unrecognized values yield ("", false).
-func cookieMode(r *http.Request, cookieName string) (m string, temp bool) {
-	c, err := r.Cookie(cookieName)
+// tempSuffix, e.g. "corp:tmp"). A value outside the configured backend keys
+// yields ("", false), so a cookie naming a backend that has since been removed
+// from BACKENDS degrades to the selector page instead of routing somewhere else.
+func cookieMode(r *http.Request, cookie cookieCfg) (m string, temp bool) {
+	c, err := r.Cookie(cookie.name)
 	if err != nil {
 		return "", false
 	}
@@ -427,12 +450,10 @@ func cookieMode(r *http.Request, cookieName string) (m string, temp bool) {
 	if strings.HasSuffix(v, tempSuffix) {
 		v, temp = strings.TrimSuffix(v, tempSuffix), true
 	}
-	switch v {
-	case "primary", "secondary":
-		return v, temp
-	default:
+	if !cookie.modes[v] {
 		return "", false
 	}
+	return v, temp
 }
 
 // promoteCookie upgrades a still-temporary routing cookie to its full lifetime
@@ -449,7 +470,7 @@ func promoteCookie(resp *http.Response, cookie cookieCfg, auth authCfg) {
 	if !setsSessionCookie(resp, auth.sessionCookie) {
 		return
 	}
-	m, temp := cookieMode(resp.Request, cookie.name)
+	m, temp := cookieMode(resp.Request, cookie)
 	if m == "" || !temp {
 		return // absent/unknown cookie, or already promoted — don't re-set every request
 	}
@@ -570,7 +591,7 @@ func mayDeleteCookie(r *http.Request) bool {
 func handleSelect(w http.ResponseWriter, r *http.Request, cookie cookieCfg) {
 	q := r.URL.Query()
 	m := q.Get("mode")
-	if m != "primary" && m != "secondary" {
+	if !cookie.modes[m] {
 		http.Error(w, "invalid mode", http.StatusBadRequest)
 		return
 	}
@@ -714,16 +735,4 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
-}
-
-func mustURL(key string) *url.URL {
-	raw := os.Getenv(key)
-	if raw == "" {
-		log.Fatalf("%s is required", key)
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		log.Fatalf("%s must be a full URL (got %q)", key, raw)
-	}
-	return u
 }

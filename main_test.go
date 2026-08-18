@@ -32,8 +32,25 @@ var testSelector = selectorPage{
 	csp:  "default-src 'none'; script-src 'sha256-stub'",
 }
 
-// testCookie is the cookie config used by the test gateway.
-var testCookie = cookieCfg{name: "auth_mode", maxAge: cookieMaxAge, tempMaxAge: 900}
+// testCookie is the cookie config used by the test gateway. Its mode set is what
+// makes "primary"/"secondary" valid cookie values here; nothing in the gateway
+// knows those names any more.
+var testCookie = cookieCfg{
+	name:       "auth_mode",
+	maxAge:     cookieMaxAge,
+	tempMaxAge: 900,
+	modes:      map[string]bool{"primary": true, "secondary": true},
+}
+
+// testCookieFor is testCookie with a different set of backend keys.
+func testCookieFor(keys ...string) cookieCfg {
+	cookie := testCookie
+	cookie.modes = map[string]bool{}
+	for _, k := range keys {
+		cookie.modes[k] = true
+	}
+	return cookie
+}
 
 // testAuth mirrors the production defaults for the oauth2-proxy front door.
 var testAuth = authCfg{
@@ -72,6 +89,29 @@ func testHandler(t *testing.T) (http.Handler, func()) {
 	}
 	h := newHandler(testCookie, testSelector, proxies)
 	return h, func() { primary.Close(); secondary.Close() }
+}
+
+// testGatewayKeys builds a gateway over an arbitrary number of keyed backends,
+// each echoing its own key, so a test can assert which one a request reached.
+func testGatewayKeys(t *testing.T, keys ...string) (http.Handler, cookieCfg, func()) {
+	t.Helper()
+	var servers []*httptest.Server
+	cookie := testCookieFor(keys...)
+	proxies := map[string]http.Handler{}
+	for _, key := range keys {
+		key := key
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, "backend="+key)
+		}))
+		servers = append(servers, srv)
+		proxies[key] = newProxy(mustParse(t, srv.URL), cookie, testAuth)
+	}
+	h := newHandler(cookie, testSelector, proxies)
+	return h, cookie, func() {
+		for _, srv := range servers {
+			srv.Close()
+		}
+	}
 }
 
 // testGatewayTo builds a gateway whose "primary" backend is the given handler,
@@ -556,7 +596,7 @@ func TestCookieMode(t *testing.T) {
 	for _, tc := range cases {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tc.value})
-		m, temp := cookieMode(req, "auth_mode")
+		m, temp := cookieMode(req, testCookie)
 		if m != tc.wantMode || temp != tc.wantTemp {
 			t.Errorf("cookieMode(%q) = (%q, %v), want (%q, %v)", tc.value, m, temp, tc.wantMode, tc.wantTemp)
 		}
@@ -1250,5 +1290,90 @@ func TestLegacyBackendVarsAreFatal(t *testing.T) {
 	}
 	if err := checkLegacyBackendVars(); err != nil {
 		t.Fatalf("checkLegacyBackendVars failed with neither var set: %v", err)
+	}
+}
+
+// Three keyed backends, no "primary"/"secondary" anywhere: each cookie value
+// must reach its own upstream.
+func TestRoutingByCookieWithManyBackends(t *testing.T) {
+	keys := []string{"corp", "guest", "partner"}
+	h, _, cleanup := testGatewayKeys(t, keys...)
+	defer cleanup()
+
+	for _, key := range keys {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: key})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if want := "backend=" + key; rec.Body.String() != want {
+			t.Errorf("cookie %q routed to %q, want %q", key, rec.Body.String(), want)
+		}
+	}
+}
+
+// Dropping a backend from BACKENDS must not re-map its cookies onto another IdP:
+// the value is simply no longer valid, and the user gets the selector back.
+func TestCookieForRemovedBackendFallsThroughToSelector(t *testing.T) {
+	h, _, cleanup := testGatewayKeys(t, "corp", "guest")
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept", "text/html")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "partner"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK || rec.Body.String() != string(testSelector.html) {
+		t.Fatalf("status = %d body = %q, want the selector page", rec.Code, rec.Body.String())
+	}
+}
+
+// Selection works for any configured key, and only for a configured key.
+func TestSelectAcceptsConfiguredKeysOnly(t *testing.T) {
+	h, _, cleanup := testGatewayKeys(t, "corp", "guest")
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/.auth/select?mode=corp&rd=/app", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", rec.Code)
+	}
+	c := routingCookieOf(t, rec)
+	if c == nil || c.Value != "corp"+tempSuffix {
+		t.Fatalf("routing cookie = %+v, want value %q", c, "corp"+tempSuffix)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/.auth/select?mode=primary", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d for an unconfigured key, want 400", rec.Code)
+	}
+}
+
+// Promotion is key-agnostic: a successful callback promotes whatever key the
+// temp cookie carries.
+func TestPromotionForCustomKey(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(successfulCallback))
+	defer srv.Close()
+
+	cookie := testCookieFor("corp")
+	proxies := map[string]http.Handler{"corp": newProxy(mustParse(t, srv.URL), cookie, testAuth)}
+	h := newHandler(cookie, testSelector, proxies)
+
+	req := navGET("/oauth2/callback?code=abc&state=xyz")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "corp" + tempSuffix})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	c := routingCookieOf(t, rec)
+	if c == nil {
+		t.Fatal("no routing cookie set, want promotion to the full lifetime")
+	}
+	if c.Value != "corp" || c.MaxAge != cookieMaxAge {
+		t.Fatalf("routing cookie = (%q, %d), want (%q, %d)", c.Value, c.MaxAge, "corp", cookieMaxAge)
 	}
 }
