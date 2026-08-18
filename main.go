@@ -345,7 +345,8 @@ func loadSelector(backends []backend) (selectorPage, error) {
 		source = "embedded"
 	}
 
-	html, err := renderSelector(shell, fragment)
+	// Named page, not html: the html package is what escapes the button labels.
+	page, err := renderSelector(shell, fragment)
 	if err != nil {
 		return selectorPage{}, fmt.Errorf("shell %s: %w", source, err)
 	}
@@ -353,8 +354,8 @@ func loadSelector(backends []backend) (selectorPage, error) {
 	if err != nil {
 		return selectorPage{}, err
 	}
-	sum := sha256.Sum256(html)
-	return selectorPage{html: html, csp: csp, source: source, sha256: hex.EncodeToString(sum[:])}, nil
+	sum := sha256.Sum256(page)
+	return selectorPage{html: page, csp: csp, source: source, sha256: hex.EncodeToString(sum[:])}, nil
 }
 
 // renderSelector splices the gateway's fragment into a shell at its single
