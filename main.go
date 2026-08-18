@@ -15,6 +15,8 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,14 +24,61 @@ import (
 //go:embed selector.html
 var selectorFS embed.FS
 
-const cookieMaxAge = 365 * 24 * 60 * 60 // ~1 year, in seconds
+const (
+	cookieMaxAge = 365 * 24 * 60 * 60 // ~1 year, in seconds
+	// tempSuffix marks a cookie that was just issued by the selector and has not
+	// yet been confirmed by a successful authenticated request.
+	tempSuffix = ":tmp"
+)
+
+// entityHeaders are the response headers that describe a body, dropped whenever a
+// proxied response's body is replaced (see rewriteAuthError).
+var entityHeaders = []string{
+	"Content-Length", "Content-Type", "Content-Encoding", "Content-Language",
+	"Content-Range", "Etag", "Expires", "Last-Modified", "Vary",
+}
+
+// cookieCfg is everything needed to issue, refresh and delete the routing cookie.
+type cookieCfg struct {
+	name string
+	// maxAge is the full lifetime, granted only once the choice is proven good.
+	maxAge int
+	// tempMaxAge is the short lifetime a fresh selection gets, so a wrong choice
+	// expires on its own instead of sticking for a year.
+	tempMaxAge int
+}
+
+// authCfg describes the auth front door sitting behind the gateway.
+// See README: "Configuration (env vars)" for the AUTH_* vars behind these fields.
+type authCfg struct {
+	// pathPrefixes are the front door's own endpoints (sign-in, callback,
+	// sign-out), normalized without a trailing slash.
+	pathPrefixes []string
+	// callbackPath is the exact path the IdP redirects back to.
+	callbackPath string
+	// sessionCookie is the name prefix of the cookie the front door sets once a
+	// session exists. A prefix, because oauth2-proxy splits large sessions into
+	// _oauth2_proxy_0, _1, ….
+	sessionCookie string
+}
 
 func main() {
 	var (
 		listenAddr       = env("LISTEN_ADDR", ":8080")
-		cookieName       = env("COOKIE_NAME", "auth_mode")
 		backendPrimary   = mustURL("BACKEND_PRIMARY")
 		backendSecondary = mustURL("BACKEND_SECONDARY")
+		cookie           = cookieCfg{
+			name:       env("COOKIE_NAME", "auth_mode"),
+			maxAge:     cookieMaxAge,
+			// 15m matches oauth2-proxy's default CSRF cookie expiry: past that the
+			// in-flight login can't complete anyway, so a longer window buys nothing.
+			tempMaxAge: envInt("COOKIE_TEMP_MAX_AGE", 900),
+		}
+		auth = authCfg{
+			pathPrefixes:  envPrefixes("AUTH_PATH_PREFIXES", "/oauth2/"),
+			callbackPath:  cleanPath(env("AUTH_CALLBACK_PATH", "/oauth2/callback")),
+			sessionCookie: env("AUTH_SESSION_COOKIE", "_oauth2_proxy"),
+		}
 	)
 
 	selectorHTML, err := selectorFS.ReadFile("selector.html")
@@ -38,27 +87,28 @@ func main() {
 	}
 
 	proxies := map[string]http.Handler{
-		"primary":   newProxy(backendPrimary),
-		"secondary": newProxy(backendSecondary),
+		"primary":   newProxy(backendPrimary, cookie, auth),
+		"secondary": newProxy(backendSecondary, cookie, auth),
 	}
 
 	srv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           newHandler(cookieName, selectorHTML, proxies),
+		Handler:           newHandler(cookie, selectorHTML, proxies),
 		MaxHeaderBytes:    1 << 20,           // large injected auth headers (X-Forwarded-Access-Token)
 		ReadHeaderTimeout: 10 * time.Second,  // slow-loris guard on headers only
 		// Deliberately NO ReadTimeout/WriteTimeout/IdleTimeout: they would sever
 		// long-lived WebSocket / SSE / long-polling connections.
 	}
 
-	log.Printf("auth-gateway listening on %s (primary=%s secondary=%s cookie=%s)",
-		listenAddr, backendPrimary, backendSecondary, cookieName)
+	log.Printf("auth-gateway listening on %s (primary=%s secondary=%s cookie=%s temp_max_age=%ds auth_paths=%s callback=%s session_cookie=%s)",
+		listenAddr, backendPrimary, backendSecondary, cookie.name, cookie.tempMaxAge,
+		strings.Join(auth.pathPrefixes, ","), auth.callbackPath, auth.sessionCookie)
 	log.Fatal(srv.ListenAndServe())
 }
 
 // newHandler wires the gateway routing: control endpoints first, then cookie-based
 // backend selection, falling back to the selector page / JSON 401.
-func newHandler(cookieName string, selectorHTML []byte, proxies map[string]http.Handler) http.Handler {
+func newHandler(cookie cookieCfg, selectorHTML []byte, proxies map[string]http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Gateway-owned control endpoints, handled regardless of cookie state.
 		switch r.URL.Path {
@@ -67,12 +117,15 @@ func newHandler(cookieName string, selectorHTML []byte, proxies map[string]http.
 			_, _ = w.Write([]byte("ok"))
 			return
 		case "/.auth/select":
-			handleSelect(w, r, cookieName)
+			handleSelect(w, r, cookie)
+			return
+		case "/.auth/reset":
+			handleReset(w, r, cookie)
 			return
 		}
 
 		// Route by our own cookie. Unknown/absent values are treated as absent.
-		if p := proxies[mode(r, cookieName)]; p != nil {
+		if p := proxies[mode(r, cookie.name)]; p != nil {
 			p.ServeHTTP(w, r)
 			return
 		}
@@ -83,8 +136,15 @@ func newHandler(cookieName string, selectorHTML []byte, proxies map[string]http.
 // newProxy builds a reverse proxy to a single backend, tuned for lossless
 // streaming and WebSocket upgrades. httputil.ReverseProxy natively hijacks and
 // bidirectionally copies Upgrade connections, so no websocket library is needed.
-func newProxy(target *url.URL) *httputil.ReverseProxy {
+func newProxy(target *url.URL, cookie cookieCfg, auth authCfg) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
+		ModifyResponse: func(resp *http.Response) error {
+			if rewriteAuthError(resp, auth) {
+				return nil
+			}
+			promoteCookie(resp, cookie, auth)
+			return nil
+		},
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.Out.URL.Scheme = target.Scheme
 			r.Out.URL.Host = target.Host
@@ -105,21 +165,163 @@ func newProxy(target *url.URL) *httputil.ReverseProxy {
 // mode returns the validated routing mode from the cookie, or "" if the cookie
 // is missing or holds an unrecognized value (never an error path).
 func mode(r *http.Request, cookieName string) string {
+	m, _ := cookieMode(r, cookieName)
+	return m
+}
+
+// cookieMode returns the validated routing mode plus whether the cookie is still
+// the short-lived variant issued at selection time (value suffixed with
+// tempSuffix, e.g. "primary:tmp"). Unrecognized values yield ("", false).
+func cookieMode(r *http.Request, cookieName string) (m string, temp bool) {
 	c, err := r.Cookie(cookieName)
 	if err != nil {
-		return ""
+		return "", false
 	}
-	switch c.Value {
+	v := c.Value
+	if strings.HasSuffix(v, tempSuffix) {
+		v, temp = strings.TrimSuffix(v, tempSuffix), true
+	}
+	switch v {
 	case "primary", "secondary":
-		return c.Value
+		return v, temp
 	default:
-		return ""
+		return "", false
+	}
+}
+
+// promoteCookie upgrades a still-temporary routing cookie to its full lifetime
+// once the auth front door proves the choice was right: a 302 off the callback
+// path that also sets the session cookie.
+// See README: "Recovering from a wrong choice" (mechanism 2).
+func promoteCookie(resp *http.Response, cookie cookieCfg, auth authCfg) {
+	if resp.StatusCode != http.StatusFound {
+		return
+	}
+	if resp.Request == nil || cleanPath(resp.Request.URL.Path) != auth.callbackPath {
+		return
+	}
+	if !setsSessionCookie(resp, auth.sessionCookie) {
+		return
+	}
+	m, temp := cookieMode(resp.Request, cookie.name)
+	if m == "" || !temp {
+		return // absent/unknown cookie, or already promoted — don't re-set every request
+	}
+	resp.Header.Add("Set-Cookie", routingCookie(cookie.name, m, cookie.maxAge).String())
+}
+
+// setsSessionCookie reports whether the response sets the front door's session
+// cookie. Matched by prefix: oauth2-proxy splits sessions too large for one
+// cookie into _oauth2_proxy_0, _oauth2_proxy_1, … and never sets the bare name.
+// MaxAge >= 0 rather than > 0: an absent Max-Age attribute parses as 0, which is
+// what oauth2-proxy's Expires-based session cookies look like. Only an explicit
+// negative Max-Age (a deletion) disqualifies the cookie.
+func setsSessionCookie(resp *http.Response, name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, c := range resp.Cookies() {
+		if strings.HasPrefix(c.Name, name) && c.Value != "" && c.MaxAge >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// rewriteAuthError turns a 401/403 on one of the front door's own endpoints into
+// a redirect to /.auth/reset, so a user who picked the wrong IdP lands back on the
+// selector instead of on a dead sign-in error page. It reports whether it rewrote.
+// See README: "Recovering from a wrong choice" (mechanism 3) for why each of the
+// three conditions below is required.
+//
+// It cannot loop: /.auth/reset is served by the gateway itself, never proxied.
+func rewriteAuthError(resp *http.Response, auth authCfg) bool {
+	if resp.Request == nil || !auth.isAuthPath(resp.Request.URL.Path) {
+		return false
+	}
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+	default:
+		return false
+	}
+	if !isNavigation(resp.Request) {
+		return false
+	}
+
+	_ = resp.Body.Close()
+	resp.Body = http.NoBody
+	resp.ContentLength = 0
+	// The body is gone, so every header describing it has to go too — a stale
+	// Content-Encoding or Etag on an empty 302 confuses strict clients.
+	for _, h := range entityHeaders {
+		resp.Header.Del(h)
+	}
+	resp.Header.Set("Cache-Control", "no-store")
+	resp.Header.Set("Location", "/.auth/reset?rd=/")
+	resp.StatusCode = http.StatusFound
+	resp.Status = strconv.Itoa(http.StatusFound) + " " + http.StatusText(http.StatusFound)
+	return true
+}
+
+// isAuthPath reports whether a path belongs to the auth front door's own
+// endpoints (sign-in page, callback, sign-out) rather than to the application.
+// The path is cleaned first, so "/oauth2/../app" is classified as the app path
+// it actually resolves to.
+func (a authCfg) isAuthPath(p string) bool {
+	p = cleanPath(p)
+	for _, prefix := range a.pathPrefixes {
+		if p == prefix || strings.HasPrefix(p, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// cleanPath normalizes a request path (resolving "." / ".." and duplicate
+// slashes) so prefix and equality matches can't be skewed by traversal segments.
+// It always returns a rooted path.
+func cleanPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	return path.Clean(p)
+}
+
+// isNavigation reports whether a request is a top-level browser navigation, the
+// only case where turning a response into a redirect makes sense. Sec-Fetch-Mode
+// is authoritative where present; older clients fall back to the Accept header.
+func isNavigation(r *http.Request) bool {
+	if m := r.Header.Get("Sec-Fetch-Mode"); m != "" {
+		return m == "navigate"
+	}
+	return strings.Contains(r.Header.Get("Accept"), "text/html")
+}
+
+// mayDeleteCookie is the CSRF guard on /.auth/reset: it reports whether the
+// request is one we're willing to clear the routing cookie for.
+// See README: "Recovering from a wrong choice" (mechanism 1).
+//
+// Absent Sec-Fetch-Site is allowed — old clients and non-browser agents must
+// still reach the endpoint by a plain GET. A cross-origin request is allowed only
+// as a top-level navigation, which a third-party page cannot silently forge the
+// way it can an <img>/fetch subresource.
+func mayDeleteCookie(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+		return true
+	default:
+		return r.Header.Get("Sec-Fetch-Mode") == "navigate"
 	}
 }
 
 // handleSelect sets the routing cookie and redirects back to a validated,
-// same-origin relative path.
-func handleSelect(w http.ResponseWriter, r *http.Request, cookieName string) {
+// same-origin relative path. The cookie is deliberately short-lived until a
+// successful authenticated request promotes it (see promoteCookie), so a wrong
+// choice expires by itself.
+func handleSelect(w http.ResponseWriter, r *http.Request, cookie cookieCfg) {
 	q := r.URL.Query()
 	m := q.Get("mode")
 	if m != "primary" && m != "secondary" {
@@ -132,16 +334,41 @@ func handleSelect(w http.ResponseWriter, r *http.Request, cookieName string) {
 		rd = "/"
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
-		Value:    m,
+	http.SetCookie(w, routingCookie(cookie.name, m+tempSuffix, cookie.tempMaxAge))
+	http.Redirect(w, r, rd, http.StatusFound)
+}
+
+// handleReset deletes the routing cookie and redirects back to a validated,
+// same-origin relative path (default "/", where the selector page is served).
+// It stays a GET on purpose, so the auth-error rewrite can reach it by redirect;
+// requests that fail the CSRF guard get the redirect but keep their cookie.
+// See README: "Recovering from a wrong choice" (mechanism 1).
+func handleReset(w http.ResponseWriter, r *http.Request, cookie cookieCfg) {
+	rd := r.URL.Query().Get("rd")
+	if !safeRedirect(rd) {
+		rd = "/"
+	}
+
+	if mayDeleteCookie(r) {
+		// MaxAge < 0 deletes. Path and the other attributes must match the ones used
+		// when setting it, or the browser keeps the original cookie alongside.
+		http.SetCookie(w, routingCookie(cookie.name, "", -1))
+	}
+	http.Redirect(w, r, rd, http.StatusFound)
+}
+
+// routingCookie builds the routing cookie with the one canonical set of
+// attributes, so a delete (maxAge < 0) always matches a previously issued cookie.
+func routingCookie(name, value string, maxAge int) *http.Cookie {
+	return &http.Cookie{
+		Name:     name,
+		Value:    value,
 		Path:     "/",
-		MaxAge:   cookieMaxAge,
+		MaxAge:   maxAge,
 		Secure:   true,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-	})
-	http.Redirect(w, r, rd, http.StatusFound)
+	}
 }
 
 // handleNoMode serves the selector page for browser GETs, and a small JSON 401
@@ -182,6 +409,54 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envPrefixes reads a comma-separated path-prefix list, falling back to def when
+// unset or left with no usable entry. Entries are normalized to a rooted,
+// trailing-slash-free form so a prefix matches both the path itself and
+// everything below it (and "/oauth2" can never match "/oauth2-app").
+func envPrefixes(key, def string) []string {
+	raw := env(key, def)
+	out := splitPrefixes(raw)
+	if len(out) == 0 {
+		log.Printf("%s = %q has no usable prefixes, using %q", key, raw, def)
+		out = splitPrefixes(def)
+	}
+	return out
+}
+
+func splitPrefixes(raw string) []string {
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		p = strings.TrimSuffix(cleanPath(p), "/")
+		// A root prefix would classify every path as an auth path and void the
+		// "never touch application 4xx" guarantee, so it is dropped.
+		if p == "" {
+			log.Print(`auth path prefix "/" covers every path, ignoring it`)
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// envInt reads a positive integer env var, falling back to def when unset,
+// unparseable or non-positive (a zero/negative MaxAge would change the cookie's
+// meaning to session/delete).
+func envInt(key string, def int) int {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		log.Printf("%s = %q is not a positive integer, using %d", key, raw, def)
+		return def
+	}
+	return n
 }
 
 func mustURL(key string) *url.URL {
