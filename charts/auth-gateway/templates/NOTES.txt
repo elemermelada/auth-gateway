@@ -3,9 +3,10 @@ auth-gateway has been deployed. 🚪
 Release:   {{ .Release.Name }}
 Namespace: {{ .Release.Namespace }}
 
-Backends routed by the "{{ .Values.config.cookieName }}" cookie:
-  primary   → {{ .Values.config.backendPrimary }}
-  secondary → {{ .Values.config.backendSecondary }}
+Backends routed by the "{{ .Values.config.cookieName }}" cookie, in selector order:
+{{- range .Values.config.backends }}
+  {{ .key }} → {{ .url }}
+{{- end }}
 
 {{- if eq .Values.service.type "ClusterIP" }}
 

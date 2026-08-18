@@ -57,10 +57,12 @@ spec:
               value: {{ .Values.config.authCallbackPath | quote }}
             - name: AUTH_SESSION_COOKIE
               value: {{ .Values.config.authSessionCookie | quote }}
-            - name: BACKEND_PRIMARY
-              value: {{ required "config.backendPrimary is required" .Values.config.backendPrimary | quote }}
-            - name: BACKEND_SECONDARY
-              value: {{ required "config.backendSecondary is required" .Values.config.backendSecondary | quote }}
+            - name: BACKENDS
+              value: {{ include "auth-gateway.backends" . | quote }}
+            {{- with (include "auth-gateway.backendLabels" .) }}
+            - name: BACKEND_LABELS
+              value: {{ . | quote }}
+            {{- end }}
             {{- if .Values.config.selectorHtml }}
             - name: SELECTOR_HTML_FILE
               value: /etc/auth-gateway/selector.html

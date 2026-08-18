@@ -40,3 +40,47 @@ Selector labels
 app.kubernetes.io/name: {{ include "auth-gateway.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+{{/*
+BACKENDS env value: the ordered "key=url" list auth-gateway routes by.
+
+Order is button order on the selector page, and each key is the value that ends
+up in a user's routing cookie — which is why the keys, not the positions, are the
+identity: reordering or removing an entry never re-points an existing cookie at a
+different provider. Validation mirrors the gateway's own, so a typo fails the
+install instead of the pods.
+*/}}
+{{- define "auth-gateway.backends" -}}
+{{- if not .Values.config.backends -}}
+{{- fail "config.backends is required: an ordered list of {key, url, label} entries. Migrating from backendPrimary/backendSecondary? Use keys `primary` and `secondary` so existing routing cookies keep working." -}}
+{{- end -}}
+{{- $parts := list -}}
+{{- range .Values.config.backends -}}
+{{- if not (regexMatch "^[a-z0-9_-]{1,64}$" (default "" .key)) -}}
+{{- fail (printf "config.backends: key %q must match [a-z0-9_-]{1,64}" (default "" .key)) -}}
+{{- end -}}
+{{- if not .url -}}
+{{- fail (printf "config.backends: entry %q has no url" .key) -}}
+{{- end -}}
+{{- if or (contains "," .url) (contains "," (default "" .label)) -}}
+{{- fail (printf "config.backends: entry %q must not contain a comma (the env vars are comma-separated lists)" .key) -}}
+{{- end -}}
+{{- $parts = append $parts (printf "%s=%s" .key .url) -}}
+{{- end -}}
+{{- join "," $parts -}}
+{{- end }}
+
+{{/*
+BACKEND_LABELS env value: the "key=label" list for entries that set a label.
+Empty when none do, so the env var is only rendered when it carries something.
+*/}}
+{{- define "auth-gateway.backendLabels" -}}
+{{- $parts := list -}}
+{{- range .Values.config.backends -}}
+{{- $key := .key -}}
+{{- with .label -}}
+{{- $parts = append $parts (printf "%s=%s" $key .) -}}
+{{- end -}}
+{{- end -}}
+{{- join "," $parts -}}
+{{- end }}

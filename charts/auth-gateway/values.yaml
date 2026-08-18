@@ -14,8 +14,8 @@ image:
   pullPolicy: IfNotPresent
 
 ## auth-gateway configuration (rendered as container env vars).
-## BACKEND_PRIMARY / BACKEND_SECONDARY are required — point them at the two
-## oauth2-proxy Services in this namespace.
+## config.backends is required — point it at the oauth2-proxy Services in this
+## namespace.
 config:
   listenAddr: ":8080"
   cookieName: "auth_mode"
@@ -34,8 +34,27 @@ config:
   ## into _oauth2_proxy_0, _1, …).
   authCallbackPath: "/oauth2/callback"
   authSessionCookie: "_oauth2_proxy"
-  backendPrimary: "http://oauth2-proxy-public"
-  backendSecondary: "http://oauth2-proxy-private"
+  ## The upstreams to route between: one entry per IdP, any number of them.
+  ##   key   — stable id, [a-z0-9_-]{1,64}. It is the value stored in the user's
+  ##           routing cookie and used in /.auth/select?mode=<key>, so it must not
+  ##           change once users have picked a provider (and renaming a key logs
+  ##           everyone using it back out to the selector).
+  ##   url   — full URL of that IdP's oauth2-proxy Service.
+  ##   label — optional button text; defaults to the key, first letter capitalized.
+  ##           No commas (the env vars are comma-separated lists).
+  ## List order is the button order on the selector page.
+  ##
+  ## Upgrading from a chart with config.backendPrimary / config.backendSecondary?
+  ## Keep the keys `primary` and `secondary` and every routing cookie already out
+  ## there stays valid — the cookie holds the key, not a position.
+  backends: []
+  # backends:
+  #   - key: primary
+  #     url: http://oauth2-proxy-public
+  #     label: Employees
+  #   - key: secondary
+  #     url: http://oauth2-proxy-private
+  #     label: Contractors
   ## Custom selector page. When non-empty, the chart puts this HTML in a ConfigMap,
   ## mounts it read-only at /etc/auth-gateway/selector.html and points
   ## SELECTOR_HTML_FILE at it; a checksum annotation on the pod template rolls the
@@ -43,8 +62,10 @@ config:
   ##
   ## This is a *shell*, not a whole page: it must contain the placeholder
   ## <!--AUTH_GATEWAY_SELECTOR--> exactly once, where auth-gateway splices in the
-  ## selector widget it owns (the links, the modes, the script). Style the widget
-  ## through the ag-* classes. One self-contained document — external scripts,
+  ## selector widget it owns (one button per config.backends entry, wired to
+  ## /.auth/select). Style the widget through the ag-* classes — .ag-options for
+  ## the list, a.ag-btn for every button, .ag-btn-<key> for a single provider.
+  ## One self-contained document — external scripts,
   ## stylesheets and fonts are blocked by the page's CSP, so images and logos
   ## travel inline as data: URIs. A shell without the placeholder is fatal at
   ## startup, on purpose. See README: "Custom selector page".
