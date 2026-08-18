@@ -2,11 +2,15 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/base64"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -18,6 +22,13 @@ func mustParse(t *testing.T, raw string) *url.URL {
 		t.Fatalf("parse %q: %v", raw, err)
 	}
 	return u
+}
+
+// testSelector is the stand-in selector page served by the test gateway. Tests
+// that care about the real rendered page go through loadSelector instead.
+var testSelector = selectorPage{
+	html: []byte("<html>SELECTOR</html>"),
+	csp:  "default-src 'none'; script-src 'sha256-stub'",
 }
 
 // testCookie is the cookie config used by the test gateway.
@@ -58,7 +69,7 @@ func testHandler(t *testing.T) (http.Handler, func()) {
 		"primary":   newProxy(mustParse(t, primary.URL), testCookie, testAuth),
 		"secondary": newProxy(mustParse(t, secondary.URL), testCookie, testAuth),
 	}
-	h := newHandler(testCookie, []byte("<html>SELECTOR</html>"), proxies)
+	h := newHandler(testCookie, testSelector, proxies)
 	return h, func() { primary.Close(); secondary.Close() }
 }
 
@@ -68,7 +79,7 @@ func testGatewayTo(t *testing.T, backend http.HandlerFunc) (http.Handler, func()
 	t.Helper()
 	srv := httptest.NewServer(backend)
 	proxies := map[string]http.Handler{"primary": newProxy(mustParse(t, srv.URL), testCookie, testAuth)}
-	return newHandler(testCookie, []byte("<html>SELECTOR</html>"), proxies), srv.Close
+	return newHandler(testCookie, testSelector, proxies), srv.Close
 }
 
 // routingCookieOf returns the Set-Cookie entry for the routing cookie, or nil.
@@ -812,7 +823,7 @@ func TestWebSocketUpgradeProxied(t *testing.T) {
 	defer backend.Close()
 
 	proxies := map[string]http.Handler{"primary": newProxy(mustParse(t, backend.URL), testCookie, testAuth)}
-	gw := httptest.NewServer(newHandler(testCookie, nil, proxies))
+	gw := httptest.NewServer(newHandler(testCookie, testSelector, proxies))
 	defer gw.Close()
 
 	gwURL := mustParse(t, gw.URL)
@@ -877,5 +888,210 @@ func TestProxyPreservesHostAndSetsXForwarded(t *testing.T) {
 	}
 	if gotProto == "" {
 		t.Fatalf("X-Forwarded-Proto not set")
+	}
+}
+
+// testShell is a minimal selector shell for the rendering tests.
+const testShell = "<html><body>" + selectorPlaceholder + "</body></html>"
+
+// clearSelectorEnv unsets both selector vars, so a test asserting on the default
+// page is not at the mercy of the developer's own environment.
+func clearSelectorEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("SELECTOR_HTML_FILE", "")
+	t.Setenv("SELECTOR_HTML", "")
+}
+
+// mustLoadSelector renders the selector page from the current environment.
+func mustLoadSelector(t *testing.T) selectorPage {
+	t.Helper()
+	sel, err := loadSelector()
+	if err != nil {
+		t.Fatalf("loadSelector: %v", err)
+	}
+	return sel
+}
+
+// inlineScriptOf returns the text content of the single inline <script> in page,
+// i.e. exactly the bytes a browser hashes for a script-src 'sha256-…' match.
+func inlineScriptOf(t *testing.T, page []byte) []byte {
+	t.Helper()
+	i, j := strings.Index(string(page), "<script>"), strings.Index(string(page), "</script>")
+	if i < 0 || j < i {
+		t.Fatalf("page has no inline <script>:\n%s", page)
+	}
+	return page[i+len("<script>") : j]
+}
+
+func TestDefaultSelectorRendersFragment(t *testing.T) {
+	clearSelectorEnv(t)
+
+	sel := mustLoadSelector(t)
+
+	if sel.source != "embedded" {
+		t.Fatalf("source = %q, want %q", sel.source, "embedded")
+	}
+	if sel.sha256 == "" {
+		t.Fatal("sha256 is empty")
+	}
+	got := string(sel.html)
+	if strings.Contains(got, selectorPlaceholder) {
+		t.Fatal("rendered page still contains the placeholder")
+	}
+	for _, want := range []string{
+		`id="ag-primary"`,
+		`id="ag-secondary"`,
+		"/.auth/select?mode=primary",
+		"/.auth/select?mode=secondary",
+		"&rd=",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rendered page missing %q:\n%s", want, got)
+		}
+	}
+	// The default shell keeps its own look, and only its own look.
+	if !strings.Contains(got, "ag-btn-primary { background") {
+		t.Fatal("rendered page lost the default shell styling")
+	}
+}
+
+func TestSelectorFromFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "selector.html")
+	if err := os.WriteFile(path, []byte(testShell), 0o644); err != nil {
+		t.Fatalf("write shell: %v", err)
+	}
+	t.Setenv("SELECTOR_HTML_FILE", path)
+
+	sel := mustLoadSelector(t)
+	if sel.source != path {
+		t.Fatalf("source = %q, want %q", sel.source, path)
+	}
+	if got := string(sel.html); !strings.HasPrefix(got, "<html><body><div class=\"ag-options\">") {
+		t.Fatalf("fragment not spliced into the file shell:\n%s", got)
+	}
+}
+
+func TestSelectorFromInline(t *testing.T) {
+	t.Setenv("SELECTOR_HTML", testShell)
+
+	sel := mustLoadSelector(t)
+	if sel.source != "inline" {
+		t.Fatalf("source = %q, want %q", sel.source, "inline")
+	}
+	if got := string(sel.html); !strings.Contains(got, `id="ag-primary"`) {
+		t.Fatalf("fragment not spliced into the inline shell:\n%s", got)
+	}
+}
+
+// A custom shell only ever replaces the cosmetics: the served links, modes and
+// script come from the gateway's fragment no matter what the shell tried to say.
+func TestCustomShellCannotOverrideTheWidget(t *testing.T) {
+	t.Setenv("SELECTOR_HTML", "<html><body>"+
+		`<a href="https://evil.example/steal">Primary</a>`+
+		selectorPlaceholder+"</body></html>")
+
+	sel := mustLoadSelector(t)
+	got := string(sel.html)
+	if !strings.Contains(got, "/.auth/select?mode=primary") {
+		t.Fatalf("rendered page lost the gateway select link:\n%s", got)
+	}
+	// The shell's own markup survives (it is just cosmetics), but the widget the
+	// gateway spliced in is the one wired to /.auth/select.
+	if strings.Count(got, "<script>") != 1 {
+		t.Fatalf("want exactly one inline script, got %d:\n%s", strings.Count(got, "<script>"), got)
+	}
+}
+
+func TestSelectorBothVarsRejected(t *testing.T) {
+	t.Setenv("SELECTOR_HTML_FILE", filepath.Join(t.TempDir(), "selector.html"))
+	t.Setenv("SELECTOR_HTML", testShell)
+
+	if _, err := loadSelector(); err == nil {
+		t.Fatal("loadSelector accepted both SELECTOR_HTML_FILE and SELECTOR_HTML")
+	}
+}
+
+func TestSelectorUnreadableFileRejected(t *testing.T) {
+	t.Setenv("SELECTOR_HTML_FILE", filepath.Join(t.TempDir(), "does-not-exist.html"))
+
+	if _, err := loadSelector(); err == nil {
+		t.Fatal("loadSelector accepted an unreadable SELECTOR_HTML_FILE")
+	}
+}
+
+func TestSelectorBadShellRejected(t *testing.T) {
+	fragment := []byte("<div>fragment</div>")
+	cases := []struct {
+		name  string
+		shell string
+	}{
+		{"no placeholder", "<html><body>no slot here</body></html>"},
+		{"two placeholders", "<html><body>" + selectorPlaceholder + selectorPlaceholder + "</body></html>"},
+		{"oversized", strings.Repeat("x", maxSelectorShell) + selectorPlaceholder},
+	}
+	for _, tc := range cases {
+		if _, err := renderSelector([]byte(tc.shell), fragment); err == nil {
+			t.Fatalf("%s: renderSelector accepted it", tc.name)
+		}
+	}
+}
+
+func TestSelectorResponseHeaders(t *testing.T) {
+	clearSelectorEnv(t)
+
+	sel := mustLoadSelector(t)
+	h := newHandler(testCookie, sel, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept", "text/html")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	want := map[string]string{
+		"Content-Type":           "text/html; charset=utf-8",
+		"Cache-Control":          "no-store",
+		"X-Content-Type-Options": "nosniff",
+	}
+	for k, v := range want {
+		if got := rec.Header().Get(k); got != v {
+			t.Fatalf("%s = %q, want %q", k, got, v)
+		}
+	}
+	csp := rec.Header().Get("Content-Security-Policy")
+	for _, want := range []string{
+		"default-src 'none'",
+		"style-src 'unsafe-inline'",
+		"img-src 'self' data:",
+		"base-uri 'none'",
+		"form-action 'self'",
+		"frame-ancestors 'none'",
+	} {
+		if !strings.Contains(csp, want) {
+			t.Fatalf("CSP %q missing %q", csp, want)
+		}
+	}
+}
+
+// The teeth behind "customization is cosmetic": the script-src hash in the served
+// CSP must match the script in the served body, or the gateway's own script would
+// be blocked (and any other script would be allowed to stand in for it).
+func TestSelectorCSPHashMatchesServedScript(t *testing.T) {
+	clearSelectorEnv(t)
+
+	sel := mustLoadSelector(t)
+	h := newHandler(testCookie, sel, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept", "text/html")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	sum := sha256.Sum256(inlineScriptOf(t, rec.Body.Bytes()))
+	want := "script-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
+	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, want) {
+		t.Fatalf("CSP %q does not pin the served script (%s)", csp, want)
 	}
 }

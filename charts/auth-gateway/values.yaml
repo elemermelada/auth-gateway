@@ -36,6 +36,27 @@ config:
   authSessionCookie: "_oauth2_proxy"
   backendPrimary: "http://oauth2-proxy-public"
   backendSecondary: "http://oauth2-proxy-private"
+  ## Custom selector page. When non-empty, the chart puts this HTML in a ConfigMap,
+  ## mounts it read-only at /etc/auth-gateway/selector.html and points
+  ## SELECTOR_HTML_FILE at it; a checksum annotation on the pod template rolls the
+  ## pods when it changes. Left empty, the image serves its built-in page.
+  ##
+  ## This is a *shell*, not a whole page: it must contain the placeholder
+  ## <!--AUTH_GATEWAY_SELECTOR--> exactly once, where auth-gateway splices in the
+  ## selector widget it owns (the links, the modes, the script). Style the widget
+  ## through the ag-* classes. One self-contained document — external scripts,
+  ## stylesheets and fonts are blocked by the page's CSP, so images and logos
+  ## travel inline as data: URIs. A shell without the placeholder is fatal at
+  ## startup, on purpose. See README: "Custom selector page".
+  selectorHtml: ""
+  # selectorHtml: |
+  #   <!doctype html>
+  #   <html lang="en">
+  #   <head><meta charset="utf-8"><title>Sign in</title>
+  #     <style>.ag-btn { display: block; padding: 1rem; }</style>
+  #   </head>
+  #   <body><h1>Acme</h1><!--AUTH_GATEWAY_SELECTOR--></body>
+  #   </html>
 
 ## Extra env vars appended verbatim (e.g. valueFrom / secretKeyRef).
 extraEnv: []

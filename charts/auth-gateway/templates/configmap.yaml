@@ -1,0 +1,17 @@
+{{- if .Values.config.selectorHtml }}
+{{/*
+The custom selector *shell* — cosmetics only. auth-gateway splices its own
+selector widget into the <!--AUTH_GATEWAY_SELECTOR--> placeholder at startup and
+refuses to start if the shell has no placeholder (or more than one), so a broken
+page fails the rollout instead of shipping. See README: "Custom selector page".
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "auth-gateway.fullname" . }}-selector
+  labels:
+    {{- include "auth-gateway.labels" . | nindent 4 }}
+data:
+  selector.html: |
+    {{- .Values.config.selectorHtml | nindent 4 }}
+{{- end }}

@@ -8,8 +8,14 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"embed"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -21,7 +27,7 @@ import (
 	"time"
 )
 
-//go:embed selector.html
+//go:embed selector.html selector_fragment.html
 var selectorFS embed.FS
 
 const (
@@ -29,6 +35,13 @@ const (
 	// tempSuffix marks a cookie that was just issued by the selector and has not
 	// yet been confirmed by a successful authenticated request.
 	tempSuffix = ":tmp"
+	// selectorPlaceholder is the token a selector shell must contain exactly once.
+	// The gateway splices its own selector fragment in its place, which is what
+	// keeps a custom page cosmetic: operators never author the links or the script.
+	selectorPlaceholder = "<!--AUTH_GATEWAY_SELECTOR-->"
+	// maxSelectorShell caps a custom shell. The rendered page is held in memory for
+	// the life of the process, and an auth page has no business being larger.
+	maxSelectorShell = 1 << 20 // 1 MiB
 )
 
 // entityHeaders are the response headers that describe a body, dropped whenever a
@@ -62,6 +75,20 @@ type authCfg struct {
 	sessionCookie string
 }
 
+// selectorPage is the rendered selector response: the page bytes plus the
+// Content-Security-Policy served with them. The CSP pins script execution to the
+// gateway's own fragment, so a <script> smuggled into a custom shell is dead —
+// that is what makes "customization is cosmetic" enforced rather than promised.
+type selectorPage struct {
+	html []byte
+	csp  string
+	// source is where the shell came from ("embedded", "inline", or a file path)
+	// and sha256 is a digest of html; both are logged at startup so an unexpected
+	// page is auditable.
+	source string
+	sha256 string
+}
+
 func main() {
 	var (
 		listenAddr       = env("LISTEN_ADDR", ":8080")
@@ -81,9 +108,11 @@ func main() {
 		}
 	)
 
-	selectorHTML, err := selectorFS.ReadFile("selector.html")
+	sel, err := loadSelector()
 	if err != nil {
-		log.Fatalf("embed selector.html: %v", err)
+		// Never fall back to the default page: a silent fallback hides a broken
+		// deploy behind something that looks like it works.
+		log.Fatalf("selector: %v", err)
 	}
 
 	proxies := map[string]http.Handler{
@@ -93,22 +122,120 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           newHandler(cookie, selectorHTML, proxies),
+		Handler:           newHandler(cookie, sel, proxies),
 		MaxHeaderBytes:    1 << 20,           // large injected auth headers (X-Forwarded-Access-Token)
 		ReadHeaderTimeout: 10 * time.Second,  // slow-loris guard on headers only
 		// Deliberately NO ReadTimeout/WriteTimeout/IdleTimeout: they would sever
 		// long-lived WebSocket / SSE / long-polling connections.
 	}
 
-	log.Printf("auth-gateway listening on %s (primary=%s secondary=%s cookie=%s temp_max_age=%ds auth_paths=%s callback=%s session_cookie=%s)",
+	log.Printf("auth-gateway listening on %s (primary=%s secondary=%s cookie=%s temp_max_age=%ds auth_paths=%s callback=%s session_cookie=%s selector=%s sha256=%s)",
 		listenAddr, backendPrimary, backendSecondary, cookie.name, cookie.tempMaxAge,
-		strings.Join(auth.pathPrefixes, ","), auth.callbackPath, auth.sessionCookie)
+		strings.Join(auth.pathPrefixes, ","), auth.callbackPath, auth.sessionCookie,
+		sel.source, sel.sha256)
 	log.Fatal(srv.ListenAndServe())
+}
+
+// loadSelector resolves the selector page from the environment: SELECTOR_HTML_FILE
+// (a shell read once, here at startup) or SELECTOR_HTML (an inline shell), falling
+// back to the embedded default. The two vars are mutually exclusive, and every
+// problem — both set, unreadable file, oversized or malformed shell — is an error,
+// never a fallback.
+//
+// Reading the file exactly once is deliberate: after boot there is no runtime file
+// access, so no traversal or symlink games and no reload primitive to abuse.
+func loadSelector() (selectorPage, error) {
+	fragment, err := selectorFS.ReadFile("selector_fragment.html")
+	if err != nil {
+		return selectorPage{}, fmt.Errorf("embed selector_fragment.html: %w", err)
+	}
+
+	file, inline := os.Getenv("SELECTOR_HTML_FILE"), os.Getenv("SELECTOR_HTML")
+	var (
+		shell  []byte
+		source string
+	)
+	switch {
+	case file != "" && inline != "":
+		// Ambiguous config: fail loud rather than quietly letting one win.
+		return selectorPage{}, errors.New("SELECTOR_HTML_FILE and SELECTOR_HTML are mutually exclusive, set at most one")
+	case file != "":
+		if shell, err = os.ReadFile(file); err != nil {
+			return selectorPage{}, fmt.Errorf("read SELECTOR_HTML_FILE: %w", err)
+		}
+		source = file
+	case inline != "":
+		shell, source = []byte(inline), "inline"
+	default:
+		if shell, err = selectorFS.ReadFile("selector.html"); err != nil {
+			return selectorPage{}, fmt.Errorf("embed selector.html: %w", err)
+		}
+		source = "embedded"
+	}
+
+	html, err := renderSelector(shell, fragment)
+	if err != nil {
+		return selectorPage{}, fmt.Errorf("shell %s: %w", source, err)
+	}
+	csp, err := selectorCSP(fragment)
+	if err != nil {
+		return selectorPage{}, err
+	}
+	sum := sha256.Sum256(html)
+	return selectorPage{html: html, csp: csp, source: source, sha256: hex.EncodeToString(sum[:])}, nil
+}
+
+// renderSelector splices the gateway's fixed fragment into a shell at its single
+// placeholder. The default shell goes through this too, so there is exactly one
+// rendering path — and when the selector becomes dynamic (>2 IdPs) the gateway
+// renders more ag-btn anchors into the same slot, leaving every shell unchanged.
+func renderSelector(shell, fragment []byte) ([]byte, error) {
+	if len(shell) > maxSelectorShell {
+		return nil, fmt.Errorf("is %d bytes, over the %d byte limit", len(shell), maxSelectorShell)
+	}
+	switch n := bytes.Count(shell, []byte(selectorPlaceholder)); n {
+	case 1:
+	case 0:
+		return nil, fmt.Errorf("does not contain the %s placeholder", selectorPlaceholder)
+	default:
+		return nil, fmt.Errorf("contains the %s placeholder %d times, want exactly 1", selectorPlaceholder, n)
+	}
+	return bytes.Replace(shell, []byte(selectorPlaceholder), fragment, 1), nil
+}
+
+// selectorCSP builds the policy served with the selector page. It is deliberately
+// close to deny-all: only the gateway's own inline script may run (pinned by
+// hash), styles may be inline, and images may only be same-origin or data: URIs.
+// External scripts, stylesheets and fonts are all blocked — the contract is one
+// self-contained document, with assets travelling inside it as data: URIs.
+func selectorCSP(fragment []byte) (string, error) {
+	hash, err := inlineScriptHash(fragment)
+	if err != nil {
+		return "", err
+	}
+	return "default-src 'none'; style-src 'unsafe-inline'; script-src '" + hash + "'; " +
+		"img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'", nil
+}
+
+// inlineScriptHash returns the CSP source expression for the fragment's single
+// inline script. It is computed from the embedded bytes at startup rather than
+// hardcoded, so the hash can never drift from the script that actually ships.
+// Browsers hash a script element's text content verbatim, which is exactly the
+// byte range between the tags.
+func inlineScriptHash(fragment []byte) (string, error) {
+	const openTag, closeTag = "<script>", "</script>"
+	i := bytes.Index(fragment, []byte(openTag))
+	j := bytes.Index(fragment, []byte(closeTag))
+	if i < 0 || j < i {
+		return "", errors.New("selector fragment has no inline <script> to hash")
+	}
+	sum := sha256.Sum256(fragment[i+len(openTag) : j])
+	return "sha256-" + base64.StdEncoding.EncodeToString(sum[:]), nil
 }
 
 // newHandler wires the gateway routing: control endpoints first, then cookie-based
 // backend selection, falling back to the selector page / JSON 401.
-func newHandler(cookie cookieCfg, selectorHTML []byte, proxies map[string]http.Handler) http.Handler {
+func newHandler(cookie cookieCfg, sel selectorPage, proxies map[string]http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Gateway-owned control endpoints, handled regardless of cookie state.
 		switch r.URL.Path {
@@ -129,7 +256,7 @@ func newHandler(cookie cookieCfg, selectorHTML []byte, proxies map[string]http.H
 			p.ServeHTTP(w, r)
 			return
 		}
-		handleNoMode(w, r, selectorHTML)
+		handleNoMode(w, r, sel)
 	})
 }
 
@@ -373,11 +500,17 @@ func routingCookie(name, value string, maxAge int) *http.Cookie {
 
 // handleNoMode serves the selector page for browser GETs, and a small JSON 401
 // for everything else.
-func handleNoMode(w http.ResponseWriter, r *http.Request, selectorHTML []byte) {
+func handleNoMode(w http.ResponseWriter, r *http.Request, sel selectorPage) {
 	if r.Method == http.MethodGet && strings.Contains(r.Header.Get("Accept"), "text/html") {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		h := w.Header()
+		h.Set("Content-Type", "text/html; charset=utf-8")
+		// The page reflects cookie state, so a copy cached after a selection is
+		// simply wrong — and an auth page must not sit in a shared proxy cache.
+		h.Set("Cache-Control", "no-store")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Content-Security-Policy", sel.csp)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(selectorHTML)
+		_, _ = w.Write(sel.html)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

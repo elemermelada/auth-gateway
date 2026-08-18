@@ -16,9 +16,18 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.podAnnotations }}
+      {{- /*
+      The selector shell is read once at process startup, so a ConfigMap edit
+      alone would never be picked up — the checksum is what rolls the pods.
+      */ -}}
+      {{- if or .Values.podAnnotations .Values.config.selectorHtml }}
       annotations:
+        {{- with .Values.config.selectorHtml }}
+        checksum/selector: {{ sha256sum . }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
     spec:
       securityContext:
@@ -52,6 +61,10 @@ spec:
               value: {{ required "config.backendPrimary is required" .Values.config.backendPrimary | quote }}
             - name: BACKEND_SECONDARY
               value: {{ required "config.backendSecondary is required" .Values.config.backendSecondary | quote }}
+            {{- if .Values.config.selectorHtml }}
+            - name: SELECTOR_HTML_FILE
+              value: /etc/auth-gateway/selector.html
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -61,12 +74,24 @@ spec:
             {{- toYaml .Values.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.config.selectorHtml }}
+          volumeMounts:
+            - name: selector
+              mountPath: /etc/auth-gateway
+              readOnly: true
+          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
+      {{- if .Values.config.selectorHtml }}
+      volumes:
+        - name: selector
+          configMap:
+            name: {{ include "auth-gateway.fullname" . }}-selector
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
