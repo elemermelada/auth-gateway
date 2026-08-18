@@ -1,6 +1,6 @@
 // Command auth-gateway is a tiny cookie-based mode selector that sits between the
-// ingress and two oauth2-proxy instances. It routes every request to a backend
-// based on its own routing cookie (auth_mode), and serves a selector page
+// ingress and any number of oauth2-proxy instances. It routes every request to a
+// backend based on its own routing cookie (auth_mode), and serves a selector page
 // when no valid mode has been chosen yet.
 //
 // Design goals: stdlib only, stateless, and lossless proxying for WebSockets,
@@ -16,12 +16,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +41,10 @@ const (
 	// The gateway splices its own selector fragment in its place, which is what
 	// keeps a custom page cosmetic: operators never author the links or the script.
 	selectorPlaceholder = "<!--AUTH_GATEWAY_SELECTOR-->"
+	// anchorsPlaceholder is the slot inside the gateway's own fragment template
+	// where the generated backend buttons go. It is an implementation detail of
+	// the fragment, not part of the shell contract operators write against.
+	anchorsPlaceholder = "<!--AUTH_GATEWAY_ANCHORS-->"
 	// maxSelectorShell caps a custom shell. The rendered page is held in memory for
 	// the life of the process, and an auth page has no business being larger.
 	maxSelectorShell = 1 << 20 // 1 MiB
@@ -51,6 +57,127 @@ var entityHeaders = []string{
 	"Content-Range", "Etag", "Expires", "Last-Modified", "Vary",
 }
 
+// backend is one configured upstream: a stable key that identifies it in the
+// routing cookie and in ?mode=, the label its selector button shows, and the URL
+// to proxy to. The key — never a position in the list — is the identity, so
+// adding or removing a backend never re-maps an existing cookie to another IdP.
+type backend struct {
+	key   string
+	label string
+	url   *url.URL
+}
+
+// backendKeyPattern locks down the charset of a backend key. Keys travel in the
+// routing cookie value, in ?mode= query params and into generated HTML class
+// names, so the charset is constrained once, here, instead of escaped in four
+// places downstream.
+var backendKeyPattern = regexp.MustCompile(`^[a-z0-9_-]{1,64}$`)
+
+// legacyBackendVars are the removed single-upstream vars BACKENDS replaced.
+var legacyBackendVars = []string{"BACKEND_PRIMARY", "BACKEND_SECONDARY"}
+
+// parseBackends parses the BACKENDS / BACKEND_LABELS pair into the ordered
+// backend list. Order is the button order on the selector page, which is why
+// this returns a slice and not a map: Go map iteration order would shuffle the
+// buttons on every process start.
+//
+// Both vars are comma-separated key=value lists. Entries are split on the first
+// "=" only, so a URL may contain "=" itself; a label may not contain a comma
+// (documented limitation of the comma-list format).
+//
+// Everything questionable is an error rather than a best effort — a bad key, a
+// duplicate, an empty list, a label for a key that does not exist. main() turns
+// each into a failed startup, because a gateway with a mistyped backend routes
+// users to a page that cannot explain itself.
+func parseBackends(list, labels string) ([]backend, error) {
+	var out []backend
+	index := map[string]int{}
+	for _, entry := range strings.Split(list, ",") {
+		if entry = strings.TrimSpace(entry); entry == "" {
+			continue
+		}
+		key, raw, ok := strings.Cut(entry, "=")
+		key, raw = strings.TrimSpace(key), strings.TrimSpace(raw)
+		if !ok || raw == "" {
+			return nil, fmt.Errorf("backend %q is not in key=url form", entry)
+		}
+		if !backendKeyPattern.MatchString(key) {
+			return nil, fmt.Errorf("backend key %q must match %s", key, backendKeyPattern)
+		}
+		if _, dup := index[key]; dup {
+			return nil, fmt.Errorf("backend key %q is listed more than once", key)
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return nil, fmt.Errorf("backend %q must be a full URL (got %q)", key, raw)
+		}
+		index[key] = len(out)
+		out = append(out, backend{key: key, label: defaultLabel(key), url: u})
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no backends configured, want a comma-separated key=url list")
+	}
+
+	for _, entry := range strings.Split(labels, ",") {
+		if entry = strings.TrimSpace(entry); entry == "" {
+			continue
+		}
+		key, label, ok := strings.Cut(entry, "=")
+		key, label = strings.TrimSpace(key), strings.TrimSpace(label)
+		if !ok || label == "" {
+			return nil, fmt.Errorf("label %q is not in key=label form", entry)
+		}
+		i, known := index[key]
+		if !known {
+			return nil, fmt.Errorf("label for unknown backend key %q", key)
+		}
+		out[i].label = label
+	}
+	return out, nil
+}
+
+// defaultLabel is the button text for a backend with no explicit label: the key
+// with its first letter upper-cased ("corp" -> "Corp"). Keys are ASCII by
+// backendKeyPattern, so slicing the first byte is safe.
+func defaultLabel(key string) string {
+	return strings.ToUpper(key[:1]) + key[1:]
+}
+
+// modeSet is the set of routing-cookie values the gateway accepts: exactly the
+// configured backend keys.
+func modeSet(backends []backend) map[string]bool {
+	set := make(map[string]bool, len(backends))
+	for _, b := range backends {
+		set[b.key] = true
+	}
+	return set
+}
+
+// describeBackends renders the backend list for the startup log line, in config
+// (button) order, so an unexpected routing target is auditable from the logs.
+func describeBackends(backends []backend) string {
+	parts := make([]string, 0, len(backends))
+	for _, b := range backends {
+		parts = append(parts, b.key+"="+b.url.Redacted())
+	}
+	return strings.Join(parts, ",")
+}
+
+// checkLegacyBackendVars rejects a deploy that still sets the removed
+// BACKEND_PRIMARY / BACKEND_SECONDARY vars. Ignoring them silently would start a
+// gateway with no backends at all (or with the wrong ones) and show every user
+// the selector page with no clue why, so this is fatal and carries the migration.
+func checkLegacyBackendVars() error {
+	for _, key := range legacyBackendVars {
+		if os.Getenv(key) != "" {
+			return fmt.Errorf("%s is no longer supported: list every upstream in BACKENDS instead "+
+				"(BACKENDS=primary=$BACKEND_PRIMARY,secondary=$BACKEND_SECONDARY reproduces the old "+
+				"behavior and keeps existing routing cookies valid)", key)
+		}
+	}
+	return nil
+}
+
 // cookieCfg is everything needed to issue, refresh and delete the routing cookie.
 type cookieCfg struct {
 	name string
@@ -59,6 +186,10 @@ type cookieCfg struct {
 	// tempMaxAge is the short lifetime a fresh selection gets, so a wrong choice
 	// expires on its own instead of sticking for a year.
 	tempMaxAge int
+	// modes is the set of accepted cookie values: exactly the configured backend
+	// keys. It lives here because every place that reads or writes the routing
+	// cookie needs to know which values are real.
+	modes map[string]bool
 }
 
 // authCfg describes the auth front door sitting behind the gateway.
@@ -90,16 +221,23 @@ type selectorPage struct {
 }
 
 func main() {
+	if err := checkLegacyBackendVars(); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	backends, err := parseBackends(os.Getenv("BACKENDS"), os.Getenv("BACKEND_LABELS"))
+	if err != nil {
+		log.Fatalf("BACKENDS: %v", err)
+	}
+
 	var (
-		listenAddr       = env("LISTEN_ADDR", ":8080")
-		backendPrimary   = mustURL("BACKEND_PRIMARY")
-		backendSecondary = mustURL("BACKEND_SECONDARY")
-		cookie           = cookieCfg{
+		listenAddr = env("LISTEN_ADDR", ":8080")
+		cookie     = cookieCfg{
 			name:       env("COOKIE_NAME", "auth_mode"),
 			maxAge:     cookieMaxAge,
 			// 15m matches oauth2-proxy's default CSRF cookie expiry: past that the
 			// in-flight login can't complete anyway, so a longer window buys nothing.
 			tempMaxAge: envInt("COOKIE_TEMP_MAX_AGE", 900),
+			modes:      modeSet(backends),
 		}
 		auth = authCfg{
 			pathPrefixes:  envPrefixes("AUTH_PATH_PREFIXES", "/oauth2/"),
@@ -108,16 +246,16 @@ func main() {
 		}
 	)
 
-	sel, err := loadSelector()
+	sel, err := loadSelector(backends)
 	if err != nil {
 		// Never fall back to the default page: a silent fallback hides a broken
 		// deploy behind something that looks like it works.
 		log.Fatalf("selector: %v", err)
 	}
 
-	proxies := map[string]http.Handler{
-		"primary":   newProxy(backendPrimary, cookie, auth),
-		"secondary": newProxy(backendSecondary, cookie, auth),
+	proxies := make(map[string]http.Handler, len(backends))
+	for _, b := range backends {
+		proxies[b.key] = newProxy(b.url, cookie, auth)
 	}
 
 	srv := &http.Server{
@@ -129,11 +267,46 @@ func main() {
 		// long-lived WebSocket / SSE / long-polling connections.
 	}
 
-	log.Printf("auth-gateway listening on %s (primary=%s secondary=%s cookie=%s temp_max_age=%ds auth_paths=%s callback=%s session_cookie=%s selector=%s sha256=%s)",
-		listenAddr, backendPrimary, backendSecondary, cookie.name, cookie.tempMaxAge,
+	log.Printf("auth-gateway listening on %s (backends=%s cookie=%s temp_max_age=%ds auth_paths=%s callback=%s session_cookie=%s selector=%s sha256=%s)",
+		listenAddr, describeBackends(backends), cookie.name, cookie.tempMaxAge,
 		strings.Join(auth.pathPrefixes, ","), auth.callbackPath, auth.sessionCookie,
 		sel.source, sel.sha256)
 	log.Fatal(srv.ListenAndServe())
+}
+
+// selectorAnchors renders one selector button per backend, in config order. The
+// key goes into an ag-btn-<key> class so a shell can style a single provider, and
+// into the ?mode= link; backendKeyPattern already guarantees both are safe. Only
+// the label comes from free-form config, so only the label is escaped.
+func selectorAnchors(backends []backend) []byte {
+	var b bytes.Buffer
+	for i, be := range backends {
+		if i > 0 {
+			b.WriteString("\n  ")
+		}
+		fmt.Fprintf(&b, `<a class="ag-btn ag-btn-%s" href="/.auth/select?mode=%s">`+
+			`<span class="ag-logo" aria-hidden="true"></span>%s</a>`,
+			be.key, be.key, html.EscapeString(be.label))
+	}
+	return b.Bytes()
+}
+
+// selectorFragment is the widget the gateway splices into a shell: the generated
+// buttons plus the fixed script that preserves the original destination. It is
+// built once, at startup, so serving the selector page stays a byte copy no
+// matter how many backends are configured.
+//
+// The script half lives in the embedded template and never varies with the
+// backend list, which is what keeps the CSP script hash identical across deploys.
+func selectorFragment(backends []backend) ([]byte, error) {
+	tmpl, err := selectorFS.ReadFile("selector_fragment.html")
+	if err != nil {
+		return nil, fmt.Errorf("embed selector_fragment.html: %w", err)
+	}
+	if n := bytes.Count(tmpl, []byte(anchorsPlaceholder)); n != 1 {
+		return nil, fmt.Errorf("fragment template contains the %s placeholder %d times, want exactly 1", anchorsPlaceholder, n)
+	}
+	return bytes.Replace(tmpl, []byte(anchorsPlaceholder), selectorAnchors(backends), 1), nil
 }
 
 // loadSelector resolves the selector page from the environment: SELECTOR_HTML_FILE
@@ -144,10 +317,10 @@ func main() {
 //
 // Reading the file exactly once is deliberate: after boot there is no runtime file
 // access, so no traversal or symlink games and no reload primitive to abuse.
-func loadSelector() (selectorPage, error) {
-	fragment, err := selectorFS.ReadFile("selector_fragment.html")
+func loadSelector(backends []backend) (selectorPage, error) {
+	fragment, err := selectorFragment(backends)
 	if err != nil {
-		return selectorPage{}, fmt.Errorf("embed selector_fragment.html: %w", err)
+		return selectorPage{}, err
 	}
 
 	file, inline := os.Getenv("SELECTOR_HTML_FILE"), os.Getenv("SELECTOR_HTML")
@@ -173,7 +346,8 @@ func loadSelector() (selectorPage, error) {
 		source = "embedded"
 	}
 
-	html, err := renderSelector(shell, fragment)
+	// Named page, not html: the html package is what escapes the button labels.
+	page, err := renderSelector(shell, fragment)
 	if err != nil {
 		return selectorPage{}, fmt.Errorf("shell %s: %w", source, err)
 	}
@@ -181,14 +355,14 @@ func loadSelector() (selectorPage, error) {
 	if err != nil {
 		return selectorPage{}, err
 	}
-	sum := sha256.Sum256(html)
-	return selectorPage{html: html, csp: csp, source: source, sha256: hex.EncodeToString(sum[:])}, nil
+	sum := sha256.Sum256(page)
+	return selectorPage{html: page, csp: csp, source: source, sha256: hex.EncodeToString(sum[:])}, nil
 }
 
-// renderSelector splices the gateway's fixed fragment into a shell at its single
+// renderSelector splices the gateway's fragment into a shell at its single
 // placeholder. The default shell goes through this too, so there is exactly one
-// rendering path — and when the selector becomes dynamic (>2 IdPs) the gateway
-// renders more ag-btn anchors into the same slot, leaving every shell unchanged.
+// rendering path — and since the backend count only changes how many ag-btn
+// anchors the fragment holds, every existing shell keeps working untouched.
 func renderSelector(shell, fragment []byte) ([]byte, error) {
 	if len(shell) > maxSelectorShell {
 		return nil, fmt.Errorf("is %d bytes, over the %d byte limit", len(shell), maxSelectorShell)
@@ -260,7 +434,7 @@ func newHandler(cookie cookieCfg, sel selectorPage, proxies map[string]http.Hand
 		}
 
 		// Route by our own cookie. Unknown/absent values are treated as absent.
-		if p := proxies[mode(r, cookie.name)]; p != nil {
+		if p := proxies[mode(r, cookie)]; p != nil {
 			p.ServeHTTP(w, r)
 			return
 		}
@@ -299,16 +473,18 @@ func newProxy(target *url.URL, cookie cookieCfg, auth authCfg) *httputil.Reverse
 
 // mode returns the validated routing mode from the cookie, or "" if the cookie
 // is missing or holds an unrecognized value (never an error path).
-func mode(r *http.Request, cookieName string) string {
-	m, _ := cookieMode(r, cookieName)
+func mode(r *http.Request, cookie cookieCfg) string {
+	m, _ := cookieMode(r, cookie)
 	return m
 }
 
 // cookieMode returns the validated routing mode plus whether the cookie is still
 // the short-lived variant issued at selection time (value suffixed with
-// tempSuffix, e.g. "primary:tmp"). Unrecognized values yield ("", false).
-func cookieMode(r *http.Request, cookieName string) (m string, temp bool) {
-	c, err := r.Cookie(cookieName)
+// tempSuffix, e.g. "corp:tmp"). A value outside the configured backend keys
+// yields ("", false), so a cookie naming a backend that has since been removed
+// from BACKENDS degrades to the selector page instead of routing somewhere else.
+func cookieMode(r *http.Request, cookie cookieCfg) (m string, temp bool) {
+	c, err := r.Cookie(cookie.name)
 	if err != nil {
 		return "", false
 	}
@@ -316,12 +492,10 @@ func cookieMode(r *http.Request, cookieName string) (m string, temp bool) {
 	if strings.HasSuffix(v, tempSuffix) {
 		v, temp = strings.TrimSuffix(v, tempSuffix), true
 	}
-	switch v {
-	case "primary", "secondary":
-		return v, temp
-	default:
+	if !cookie.modes[v] {
 		return "", false
 	}
+	return v, temp
 }
 
 // promoteCookie upgrades a still-temporary routing cookie to its full lifetime
@@ -338,7 +512,7 @@ func promoteCookie(resp *http.Response, cookie cookieCfg, auth authCfg) {
 	if !setsSessionCookie(resp, auth.sessionCookie) {
 		return
 	}
-	m, temp := cookieMode(resp.Request, cookie.name)
+	m, temp := cookieMode(resp.Request, cookie)
 	if m == "" || !temp {
 		return // absent/unknown cookie, or already promoted — don't re-set every request
 	}
@@ -459,7 +633,7 @@ func mayDeleteCookie(r *http.Request) bool {
 func handleSelect(w http.ResponseWriter, r *http.Request, cookie cookieCfg) {
 	q := r.URL.Query()
 	m := q.Get("mode")
-	if m != "primary" && m != "secondary" {
+	if !cookie.modes[m] {
 		http.Error(w, "invalid mode", http.StatusBadRequest)
 		return
 	}
@@ -603,16 +777,4 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
-}
-
-func mustURL(key string) *url.URL {
-	raw := os.Getenv(key)
-	if raw == "" {
-		log.Fatalf("%s is required", key)
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		log.Fatalf("%s must be a full URL (got %q)", key, raw)
-	}
-	return u
 }

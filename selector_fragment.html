@@ -1,10 +1,12 @@
 <div class="ag-options">
-  <a id="ag-primary" class="ag-btn ag-btn-primary" href="/.auth/select?mode=primary"><span class="ag-logo" aria-hidden="true"></span>Primary</a>
-  <a id="ag-secondary" class="ag-btn ag-btn-secondary" href="/.auth/select?mode=secondary"><span class="ag-logo" aria-hidden="true"></span>Secondary</a>
+  <!--AUTH_GATEWAY_ANCHORS-->
 </div>
 <script>
   // Preserve where the user was headed so /.auth/select can redirect back.
+  // Every button is handled the same way, so this script is byte-identical
+  // whatever the backend list is — which keeps the CSP script hash stable.
   var rd = encodeURIComponent(location.pathname + location.search);
-  document.getElementById('ag-primary').href = '/.auth/select?mode=primary&rd=' + rd;
-  document.getElementById('ag-secondary').href = '/.auth/select?mode=secondary&rd=' + rd;
+  document.querySelectorAll('.ag-options a.ag-btn').forEach(function (a) {
+    a.href = a.href + '&rd=' + rd;
+  });
 </script>

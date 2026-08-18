@@ -34,13 +34,16 @@ jobs:
       - name: Lint chart
         run: helm lint ${{ env.CHART_DIR }}
 
-      # Renders the templates to catch errors `helm lint` misses. The required
-      # backend values are supplied so the render doesn't fail on them.
+      # Renders the templates to catch errors `helm lint` misses. A backend list
+      # is supplied because config.backends is required (and validated) by the chart.
       - name: Template chart (render check)
         run: |
           helm template auth-gateway ${{ env.CHART_DIR }} \
-            --set config.backendPrimary=http://primary \
-            --set config.backendSecondary=http://secondary \
+            --set config.backends[0].key=corp \
+            --set config.backends[0].url=http://corp \
+            --set config.backends[0].label=Corporate \
+            --set config.backends[1].key=guest \
+            --set config.backends[1].url=http://guest \
             > /dev/null
 
       - name: Package chart
