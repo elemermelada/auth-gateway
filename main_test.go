@@ -1160,3 +1160,95 @@ func TestSelectorFragmentStylingContract(t *testing.T) {
 		t.Fatalf("want one ag-logo per button (%d), got %d:\n%s", len(buttons), n, got)
 	}
 }
+
+// mustBackends parses a BACKENDS list that the test expects to be valid.
+func mustBackends(t *testing.T, list, labels string) []backend {
+	t.Helper()
+	b, err := parseBackends(list, labels)
+	if err != nil {
+		t.Fatalf("parseBackends(%q, %q): %v", list, labels, err)
+	}
+	return b
+}
+
+// The list order is the button order on the selector page, so it must survive
+// parsing verbatim — and a key with no label gets the key, title-cased.
+func TestParseBackendsOrderAndDefaults(t *testing.T) {
+	got := mustBackends(t, "corp=http://corp:4180,guest=http://guest:4181,partner-2=http://partner:4182", "")
+
+	want := []struct{ key, label, host string }{
+		{"corp", "Corp", "corp:4180"},
+		{"guest", "Guest", "guest:4181"},
+		{"partner-2", "Partner-2", "partner:4182"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d backends, want %d: %+v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i].key != w.key || got[i].label != w.label || got[i].url.Host != w.host {
+			t.Errorf("backend %d = (%q, %q, %q), want (%q, %q, %q)",
+				i, got[i].key, got[i].label, got[i].url.Host, w.key, w.label, w.host)
+		}
+	}
+}
+
+// A URL may contain "=" itself, so entries split on the first one only.
+func TestParseBackendsSplitsOnFirstEquals(t *testing.T) {
+	got := mustBackends(t, "corp=http://corp:4180/?a=b", "")
+	if len(got) != 1 || got[0].url.String() != "http://corp:4180/?a=b" {
+		t.Fatalf("got %+v, want one backend with the query intact", got)
+	}
+}
+
+func TestParseBackendsLabels(t *testing.T) {
+	got := mustBackends(t, "corp=http://corp,guest=http://guest", "corp=Corporate SSO")
+	if got[0].label != "Corporate SSO" {
+		t.Errorf("corp label = %q, want %q", got[0].label, "Corporate SSO")
+	}
+	if got[1].label != "Guest" {
+		t.Errorf("guest label = %q, want the default %q", got[1].label, "Guest")
+	}
+}
+
+func TestParseBackendsRejectsBadConfig(t *testing.T) {
+	cases := []struct{ name, list, labels string }{
+		{"empty list", "", ""},
+		{"blank entries only", " , ", ""},
+		{"no url", "corp", ""},
+		{"empty url", "corp=", ""},
+		{"relative url", "corp=/corp", ""},
+		{"uppercase key", "Corp=http://corp", ""},
+		{"dotted key", "corp.eu=http://corp", ""},
+		{"empty key", "=http://corp", ""},
+		{"key too long", strings.Repeat("a", 65) + "=http://corp", ""},
+		{"duplicate key", "corp=http://a,corp=http://b", ""},
+		{"label without value", "corp=http://corp", "corp"},
+		{"label for unknown key", "corp=http://corp", "guest=Guest access"},
+	}
+	for _, tc := range cases {
+		if _, err := parseBackends(tc.list, tc.labels); err == nil {
+			t.Errorf("%s: parseBackends(%q, %q) accepted it", tc.name, tc.list, tc.labels)
+		}
+	}
+}
+
+// The removed vars must fail the deploy, not be ignored: a gateway that silently
+// drops them serves the selector page to everyone with no explanation.
+func TestLegacyBackendVarsAreFatal(t *testing.T) {
+	for _, key := range legacyBackendVars {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "http://localhost:4180")
+			err := checkLegacyBackendVars()
+			if err == nil {
+				t.Fatalf("checkLegacyBackendVars accepted %s", key)
+			}
+			// The message has to carry the migration, or an operator is left guessing.
+			if !strings.Contains(err.Error(), "BACKENDS") {
+				t.Errorf("error %q does not point at BACKENDS", err)
+			}
+		})
+	}
+	if err := checkLegacyBackendVars(); err != nil {
+		t.Fatalf("checkLegacyBackendVars failed with neither var set: %v", err)
+	}
+}

@@ -51,6 +51,117 @@ var entityHeaders = []string{
 	"Content-Range", "Etag", "Expires", "Last-Modified", "Vary",
 }
 
+// backend is one configured upstream: a stable key that identifies it in the
+// routing cookie and in ?mode=, the label its selector button shows, and the URL
+// to proxy to. The key — never a position in the list — is the identity, so
+// adding or removing a backend never re-maps an existing cookie to another IdP.
+type backend struct {
+	key   string
+	label string
+	url   *url.URL
+}
+
+// backendKeyPattern locks down the charset of a backend key. Keys travel in the
+// routing cookie value, in ?mode= query params and into generated HTML class
+// names, so the charset is constrained once, here, instead of escaped in four
+// places downstream.
+var backendKeyPattern = regexp.MustCompile(`^[a-z0-9_-]{1,64}$`)
+
+// legacyBackendVars are the removed single-upstream vars BACKENDS replaced.
+var legacyBackendVars = []string{"BACKEND_PRIMARY", "BACKEND_SECONDARY"}
+
+// parseBackends parses the BACKENDS / BACKEND_LABELS pair into the ordered
+// backend list. Order is the button order on the selector page, which is why
+// this returns a slice and not a map: Go map iteration order would shuffle the
+// buttons on every process start.
+//
+// Both vars are comma-separated key=value lists. Entries are split on the first
+// "=" only, so a URL may contain "=" itself; a label may not contain a comma
+// (documented limitation of the comma-list format).
+//
+// Everything questionable is an error rather than a best effort — a bad key, a
+// duplicate, an empty list, a label for a key that does not exist. main() turns
+// each into a failed startup, because a gateway with a mistyped backend routes
+// users to a page that cannot explain itself.
+func parseBackends(list, labels string) ([]backend, error) {
+	var out []backend
+	index := map[string]int{}
+	for _, entry := range strings.Split(list, ",") {
+		if entry = strings.TrimSpace(entry); entry == "" {
+			continue
+		}
+		key, raw, ok := strings.Cut(entry, "=")
+		key, raw = strings.TrimSpace(key), strings.TrimSpace(raw)
+		if !ok || raw == "" {
+			return nil, fmt.Errorf("backend %q is not in key=url form", entry)
+		}
+		if !backendKeyPattern.MatchString(key) {
+			return nil, fmt.Errorf("backend key %q must match %s", key, backendKeyPattern)
+		}
+		if _, dup := index[key]; dup {
+			return nil, fmt.Errorf("backend key %q is listed more than once", key)
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return nil, fmt.Errorf("backend %q must be a full URL (got %q)", key, raw)
+		}
+		index[key] = len(out)
+		out = append(out, backend{key: key, label: defaultLabel(key), url: u})
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no backends configured, want a comma-separated key=url list")
+	}
+
+	for _, entry := range strings.Split(labels, ",") {
+		if entry = strings.TrimSpace(entry); entry == "" {
+			continue
+		}
+		key, label, ok := strings.Cut(entry, "=")
+		key, label = strings.TrimSpace(key), strings.TrimSpace(label)
+		if !ok || label == "" {
+			return nil, fmt.Errorf("label %q is not in key=label form", entry)
+		}
+		i, known := index[key]
+		if !known {
+			return nil, fmt.Errorf("label for unknown backend key %q", key)
+		}
+		out[i].label = label
+	}
+	return out, nil
+}
+
+// defaultLabel is the button text for a backend with no explicit label: the key
+// with its first letter upper-cased ("corp" -> "Corp"). Keys are ASCII by
+// backendKeyPattern, so slicing the first byte is safe.
+func defaultLabel(key string) string {
+	return strings.ToUpper(key[:1]) + key[1:]
+}
+
+// modeSet is the set of routing-cookie values the gateway accepts: exactly the
+// configured backend keys.
+func modeSet(backends []backend) map[string]bool {
+	set := make(map[string]bool, len(backends))
+	for _, b := range backends {
+		set[b.key] = true
+	}
+	return set
+}
+
+// checkLegacyBackendVars rejects a deploy that still sets the removed
+// BACKEND_PRIMARY / BACKEND_SECONDARY vars. Ignoring them silently would start a
+// gateway with no backends at all (or with the wrong ones) and show every user
+// the selector page with no clue why, so this is fatal and carries the migration.
+func checkLegacyBackendVars() error {
+	for _, key := range legacyBackendVars {
+		if os.Getenv(key) != "" {
+			return fmt.Errorf("%s is no longer supported: list every upstream in BACKENDS instead "+
+				"(BACKENDS=primary=$BACKEND_PRIMARY,secondary=$BACKEND_SECONDARY reproduces the old "+
+				"behavior and keeps existing routing cookies valid)", key)
+		}
+	}
+	return nil
+}
+
 // cookieCfg is everything needed to issue, refresh and delete the routing cookie.
 type cookieCfg struct {
 	name string
