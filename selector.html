@@ -5,7 +5,8 @@
   the AUTH_GATEWAY_SELECTOR placeholder below.
 
   A custom page (SELECTOR_HTML_FILE / SELECTOR_HTML) is a shell just like this
-  one: one self-contained document, styling the widget through the ag-* classes.
+  one: one self-contained document, styling the widget through the ag-* classes
+  (one .ag-btn per configured backend, each also carrying ag-btn-<key>).
   See README: "Custom selector page".
 -->
 <html lang="en">
@@ -31,19 +32,21 @@
     h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
     p { margin: 0 0 1.5rem; color: #666; font-size: .9rem; }
     .ag-options { display: grid; gap: .75rem; }
+    /* One uniform button style: the gateway renders a button per configured
+       backend and ranks none of them. A shell that wants to tell providers
+       apart targets the per-backend ag-btn-<key> class. */
     a.ag-btn {
       display: block; padding: .85rem 1rem; border-radius: 8px;
       text-decoration: none; font-weight: 600; font-size: 1rem;
-      border: 1px solid transparent; transition: filter .1s;
+      background: #eef1f6; color: #1a1a1a;
+      border: 1px solid #d6dae2; transition: filter .1s;
     }
     a.ag-btn:hover { filter: brightness(.95); }
-    .ag-btn-primary { background: #2b5cff; color: #fff; }
-    .ag-btn-secondary { background: #eef1f6; color: #1a1a1a; border-color: #d6dae2; }
     @media (prefers-color-scheme: dark) {
       body { background: #12141a; color: #e9eaed; }
       .card { background: #1c1f27; box-shadow: 0 6px 24px rgba(0,0,0,.4); }
       p { color: #9aa0ac; }
-      .ag-btn-secondary { background: #262a34; color: #e9eaed; border-color: #333947; }
+      a.ag-btn { background: #262a34; color: #e9eaed; border-color: #333947; }
     }
   </style>
 </head>

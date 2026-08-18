@@ -99,7 +99,6 @@ func testGatewayKeys(t *testing.T, keys ...string) (http.Handler, cookieCfg, fun
 	cookie := testCookieFor(keys...)
 	proxies := map[string]http.Handler{}
 	for _, key := range keys {
-		key := key
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.WriteString(w, "backend="+key)
 		}))
@@ -951,14 +950,34 @@ func clearSelectorEnv(t *testing.T) {
 	t.Setenv("SELECTOR_HTML", "")
 }
 
-// mustLoadSelector renders the selector page from the current environment.
-func mustLoadSelector(t *testing.T) selectorPage {
+// testBackendList is the two-backend configuration the rendering tests render
+// against. It keeps the historical primary/secondary keys, so these tests also
+// pin that a deploy migrating with those keys keeps its old-looking page.
+const testBackendList = "primary=http://primary:4180,secondary=http://secondary:4181"
+
+// mustLoadSelector renders the selector page from the current environment, for
+// the given backend list (defaulting to testBackendList).
+func mustLoadSelector(t *testing.T, list ...string) selectorPage {
 	t.Helper()
-	sel, err := loadSelector()
+	raw := testBackendList
+	if len(list) == 1 {
+		raw = list[0]
+	}
+	sel, err := loadSelector(mustBackends(t, raw, ""))
 	if err != nil {
 		t.Fatalf("loadSelector: %v", err)
 	}
 	return sel
+}
+
+// mustFragment builds the spliced-in widget for a backend list.
+func mustFragment(t *testing.T, list, labels string) string {
+	t.Helper()
+	fragment, err := selectorFragment(mustBackends(t, list, labels))
+	if err != nil {
+		t.Fatalf("selectorFragment: %v", err)
+	}
+	return string(fragment)
 }
 
 // inlineScriptOf returns the text content of the single inline <script> in page,
@@ -987,9 +1006,12 @@ func TestDefaultSelectorRendersFragment(t *testing.T) {
 	if strings.Contains(got, selectorPlaceholder) {
 		t.Fatal("rendered page still contains the placeholder")
 	}
+	if strings.Contains(got, anchorsPlaceholder) {
+		t.Fatal("rendered page still contains the anchors placeholder")
+	}
 	for _, want := range []string{
-		`id="ag-primary"`,
-		`id="ag-secondary"`,
+		`class="ag-btn ag-btn-primary"`,
+		`class="ag-btn ag-btn-secondary"`,
 		"/.auth/select?mode=primary",
 		"/.auth/select?mode=secondary",
 		"&rd=",
@@ -999,7 +1021,7 @@ func TestDefaultSelectorRendersFragment(t *testing.T) {
 		}
 	}
 	// The default shell keeps its own look, and only its own look.
-	if !strings.Contains(got, "ag-btn-primary { background") {
+	if !strings.Contains(got, "a.ag-btn {") {
 		t.Fatal("rendered page lost the default shell styling")
 	}
 }
@@ -1027,7 +1049,7 @@ func TestSelectorFromInline(t *testing.T) {
 	if sel.source != "inline" {
 		t.Fatalf("source = %q, want %q", sel.source, "inline")
 	}
-	if got := string(sel.html); !strings.Contains(got, `id="ag-primary"`) {
+	if got := string(sel.html); !strings.Contains(got, `class="ag-btn ag-btn-primary"`) {
 		t.Fatalf("fragment not spliced into the inline shell:\n%s", got)
 	}
 }
@@ -1055,7 +1077,7 @@ func TestSelectorBothVarsRejected(t *testing.T) {
 	t.Setenv("SELECTOR_HTML_FILE", filepath.Join(t.TempDir(), "selector.html"))
 	t.Setenv("SELECTOR_HTML", testShell)
 
-	if _, err := loadSelector(); err == nil {
+	if _, err := loadSelector(mustBackends(t, testBackendList, "")); err == nil {
 		t.Fatal("loadSelector accepted both SELECTOR_HTML_FILE and SELECTOR_HTML")
 	}
 }
@@ -1063,7 +1085,7 @@ func TestSelectorBothVarsRejected(t *testing.T) {
 func TestSelectorUnreadableFileRejected(t *testing.T) {
 	t.Setenv("SELECTOR_HTML_FILE", filepath.Join(t.TempDir(), "does-not-exist.html"))
 
-	if _, err := loadSelector(); err == nil {
+	if _, err := loadSelector(mustBackends(t, testBackendList, "")); err == nil {
 		t.Fatal("loadSelector accepted an unreadable SELECTOR_HTML_FILE")
 	}
 }
@@ -1164,11 +1186,7 @@ func TestInlineScriptHashRequiresExactlyOneBareScript(t *testing.T) {
 		}
 	}
 
-	fragment, err := selectorFS.ReadFile("selector_fragment.html")
-	if err != nil {
-		t.Fatalf("read embedded fragment: %v", err)
-	}
-	if _, err := inlineScriptHash(fragment); err != nil {
+	if _, err := inlineScriptHash([]byte(mustFragment(t, testBackendList, ""))); err != nil {
 		t.Fatalf("inlineScriptHash rejected the shipped fragment: %v", err)
 	}
 }
@@ -1177,20 +1195,17 @@ func TestInlineScriptHashRequiresExactlyOneBareScript(t *testing.T) {
 // class names are a public styling contract, so future fragment edits must not
 // break shells that rely on them.
 func TestSelectorFragmentStylingContract(t *testing.T) {
-	fragment, err := selectorFS.ReadFile("selector_fragment.html")
-	if err != nil {
-		t.Fatalf("read embedded fragment: %v", err)
-	}
-	got := string(fragment)
+	got := mustFragment(t, "corp=http://corp,guest=http://guest,partner=http://partner", "")
 
 	if !strings.Contains(got, `<div class="ag-options">`) {
 		t.Fatalf("fragment lost the .ag-options wrapper:\n%s", got)
 	}
 	buttons := regexp.MustCompile(`<a [^>]*class="ag-btn [^"]*"[^>]*>`).FindAllString(got, -1)
-	if len(buttons) != 2 {
-		t.Fatalf("want 2 ag-btn anchors, got %d:\n%s", len(buttons), got)
+	if len(buttons) != 3 {
+		t.Fatalf("want 3 ag-btn anchors, got %d:\n%s", len(buttons), got)
 	}
-	for _, class := range []string{"ag-btn-primary", "ag-btn-secondary"} {
+	// Every key gets its own class, so a shell can style one provider alone.
+	for _, class := range []string{"ag-btn-corp", "ag-btn-guest", "ag-btn-partner"} {
 		if !strings.Contains(got, class) {
 			t.Fatalf("fragment missing %s:\n%s", class, got)
 		}
@@ -1198,6 +1213,76 @@ func TestSelectorFragmentStylingContract(t *testing.T) {
 	// Each button carries a dedicated logo hook, zero-size until a shell styles it.
 	if n := strings.Count(got, `<span class="ag-logo" aria-hidden="true"></span>`); n != len(buttons) {
 		t.Fatalf("want one ag-logo per button (%d), got %d:\n%s", len(buttons), n, got)
+	}
+}
+
+// The button order is the BACKENDS order — the one thing an operator controls
+// about the page without writing a shell.
+func TestSelectorAnchorsFollowConfigOrder(t *testing.T) {
+	got := mustFragment(t, "guest=http://guest,corp=http://corp,partner=http://partner", "")
+
+	links := regexp.MustCompile(`/\.auth/select\?mode=([a-z0-9_-]+)`).FindAllStringSubmatch(got, -1)
+	var keys []string
+	for _, m := range links {
+		keys = append(keys, m[1])
+	}
+	want := []string{"guest", "corp", "partner"}
+	if strings.Join(keys, ",") != strings.Join(want, ",") {
+		t.Fatalf("anchor order = %v, want %v:\n%s", keys, want, got)
+	}
+}
+
+// Labels are the only free-form config that reaches the page, so they are the
+// only thing that has to be escaped.
+func TestSelectorLabelsAreEscaped(t *testing.T) {
+	got := mustFragment(t, "corp=http://corp", `corp=<script>alert(1)</script> & co`)
+
+	if strings.Contains(got, "<script>alert(1)</script>") {
+		t.Fatalf("label was not escaped:\n%s", got)
+	}
+	if !strings.Contains(got, "&lt;script&gt;alert(1)&lt;/script&gt; &amp; co") {
+		t.Fatalf("escaped label missing:\n%s", got)
+	}
+	// And the fragment still holds exactly the one script the CSP pins.
+	if _, err := inlineScriptHash([]byte(got)); err != nil {
+		t.Fatalf("a label smuggled a script past inlineScriptHash: %v", err)
+	}
+}
+
+// The script is generated once and never varies with the backend list: that is
+// what lets the CSP hash be computed from the fragment and stay stable across
+// deploys with different numbers of IdPs.
+func TestSelectorScriptIsIdenticalForAnyBackendCount(t *testing.T) {
+	two := mustFragment(t, testBackendList, "")
+	five := mustFragment(t, "a=http://a,b=http://b,c=http://c,d=http://d,e=http://e", "")
+
+	if got, want := string(inlineScriptOf(t, []byte(five))), string(inlineScriptOf(t, []byte(two))); got != want {
+		t.Fatalf("script differs with the backend count:\n%q\nvs\n%q", got, want)
+	}
+	twoHash, err := inlineScriptHash([]byte(two))
+	if err != nil {
+		t.Fatalf("inlineScriptHash: %v", err)
+	}
+	fiveHash, err := inlineScriptHash([]byte(five))
+	if err != nil {
+		t.Fatalf("inlineScriptHash: %v", err)
+	}
+	if twoHash != fiveHash {
+		t.Fatalf("CSP hash %s != %s", fiveHash, twoHash)
+	}
+}
+
+// A custom shell is written once and must keep working as backends come and go.
+func TestCustomShellRendersEveryBackend(t *testing.T) {
+	t.Setenv("SELECTOR_HTML", testShell)
+
+	sel := mustLoadSelector(t, "corp=http://corp,guest=http://guest,partner=http://partner")
+
+	got := string(sel.html)
+	for _, key := range []string{"corp", "guest", "partner"} {
+		if !strings.Contains(got, "/.auth/select?mode="+key) {
+			t.Fatalf("custom shell missing the %s button:\n%s", key, got)
+		}
 	}
 }
 

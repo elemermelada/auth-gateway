@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -39,6 +40,10 @@ const (
 	// The gateway splices its own selector fragment in its place, which is what
 	// keeps a custom page cosmetic: operators never author the links or the script.
 	selectorPlaceholder = "<!--AUTH_GATEWAY_SELECTOR-->"
+	// anchorsPlaceholder is the slot inside the gateway's own fragment template
+	// where the generated backend buttons go. It is an implementation detail of
+	// the fragment, not part of the shell contract operators write against.
+	anchorsPlaceholder = "<!--AUTH_GATEWAY_ANCHORS-->"
 	// maxSelectorShell caps a custom shell. The rendered page is held in memory for
 	// the life of the process, and an auth page has no business being larger.
 	maxSelectorShell = 1 << 20 // 1 MiB
@@ -240,7 +245,7 @@ func main() {
 		}
 	)
 
-	sel, err := loadSelector()
+	sel, err := loadSelector(backends)
 	if err != nil {
 		// Never fall back to the default page: a silent fallback hides a broken
 		// deploy behind something that looks like it works.
@@ -268,6 +273,41 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
+// selectorAnchors renders one selector button per backend, in config order. The
+// key goes into an ag-btn-<key> class so a shell can style a single provider, and
+// into the ?mode= link; backendKeyPattern already guarantees both are safe. Only
+// the label comes from free-form config, so only the label is escaped.
+func selectorAnchors(backends []backend) []byte {
+	var b bytes.Buffer
+	for i, be := range backends {
+		if i > 0 {
+			b.WriteString("\n  ")
+		}
+		fmt.Fprintf(&b, `<a class="ag-btn ag-btn-%s" href="/.auth/select?mode=%s">`+
+			`<span class="ag-logo" aria-hidden="true"></span>%s</a>`,
+			be.key, be.key, html.EscapeString(be.label))
+	}
+	return b.Bytes()
+}
+
+// selectorFragment is the widget the gateway splices into a shell: the generated
+// buttons plus the fixed script that preserves the original destination. It is
+// built once, at startup, so serving the selector page stays a byte copy no
+// matter how many backends are configured.
+//
+// The script half lives in the embedded template and never varies with the
+// backend list, which is what keeps the CSP script hash identical across deploys.
+func selectorFragment(backends []backend) ([]byte, error) {
+	tmpl, err := selectorFS.ReadFile("selector_fragment.html")
+	if err != nil {
+		return nil, fmt.Errorf("embed selector_fragment.html: %w", err)
+	}
+	if n := bytes.Count(tmpl, []byte(anchorsPlaceholder)); n != 1 {
+		return nil, fmt.Errorf("fragment template contains the %s placeholder %d times, want exactly 1", anchorsPlaceholder, n)
+	}
+	return bytes.Replace(tmpl, []byte(anchorsPlaceholder), selectorAnchors(backends), 1), nil
+}
+
 // loadSelector resolves the selector page from the environment: SELECTOR_HTML_FILE
 // (a shell read once, here at startup) or SELECTOR_HTML (an inline shell), falling
 // back to the embedded default. The two vars are mutually exclusive, and every
@@ -276,10 +316,10 @@ func main() {
 //
 // Reading the file exactly once is deliberate: after boot there is no runtime file
 // access, so no traversal or symlink games and no reload primitive to abuse.
-func loadSelector() (selectorPage, error) {
-	fragment, err := selectorFS.ReadFile("selector_fragment.html")
+func loadSelector(backends []backend) (selectorPage, error) {
+	fragment, err := selectorFragment(backends)
 	if err != nil {
-		return selectorPage{}, fmt.Errorf("embed selector_fragment.html: %w", err)
+		return selectorPage{}, err
 	}
 
 	file, inline := os.Getenv("SELECTOR_HTML_FILE"), os.Getenv("SELECTOR_HTML")
@@ -317,10 +357,10 @@ func loadSelector() (selectorPage, error) {
 	return selectorPage{html: html, csp: csp, source: source, sha256: hex.EncodeToString(sum[:])}, nil
 }
 
-// renderSelector splices the gateway's fixed fragment into a shell at its single
+// renderSelector splices the gateway's fragment into a shell at its single
 // placeholder. The default shell goes through this too, so there is exactly one
-// rendering path — and when the selector becomes dynamic (>2 IdPs) the gateway
-// renders more ag-btn anchors into the same slot, leaving every shell unchanged.
+// rendering path — and since the backend count only changes how many ag-btn
+// anchors the fragment holds, every existing shell keeps working untouched.
 func renderSelector(shell, fragment []byte) ([]byte, error) {
 	if len(shell) > maxSelectorShell {
 		return nil, fmt.Errorf("is %d bytes, over the %d byte limit", len(shell), maxSelectorShell)
