@@ -2,27 +2,37 @@
 
 Oauth2-Proxy instance selector frontdoor to effectively enable a multi-provider setup.
 
-A tiny, stateless Go reverse proxy that sits between the ingress and two
-`oauth2-proxy` instances. Instead of discriminating by **hostname**, it routes by
-its **own cookie** (`auth_mode`), so both auth modes can live behind a single
+A tiny, stateless Go reverse proxy that sits between the ingress and any number
+of `oauth2-proxy` instances. Instead of discriminating by **hostname**, it routes
+by its **own cookie** (`auth_mode`), so every auth mode can live behind a single
 hostname/ingress.
 
 ```
-ingress ──► auth-gateway ──┬─► oauth2-proxy-primary    ──► app
-                           └─► oauth2-proxy-secondary  ──► app
+ingress ──► auth-gateway ──┬─► oauth2-proxy-corp     ──► app
+                           ├─► oauth2-proxy-guest    ──► app
+                           └─► oauth2-proxy-partner  ──► app
 ```
+
+Each backend is configured with a **key** (`corp`, `guest`, …). The key is what
+the routing cookie holds and what `/.auth/select?mode=<key>` names, so it — not a
+position in a list — is a provider's identity: adding or removing a backend never
+re-points anybody's existing cookie at a different IdP.
 
 ## Behavior
 
 | Situation | Response |
 | --- | --- |
-| Valid `auth_mode` cookie (`primary`\|`secondary`) | Reverse-proxy **all** paths (incl. `/oauth2/*`, WebSockets) to the matching backend |
-| No/unknown cookie + `GET` with `Accept: text/html` | `200` selector page (two buttons), `no-store` + `nosniff` + a locked-down CSP. Built-in by default, customizable per deploy — see [Custom selector page](#custom-selector-page) |
+| `auth_mode` cookie holding a configured backend key | Reverse-proxy **all** paths (incl. `/oauth2/*`, WebSockets) to the matching backend |
+| No/unknown cookie + `GET` with `Accept: text/html` | `200` selector page (one button per configured backend), `no-store` + `nosniff` + a locked-down CSP. Built-in by default, customizable per deploy — see [Custom selector page](#custom-selector-page) |
 | No/unknown cookie + anything else | `401` with small JSON body |
-| `GET /.auth/select?mode=<primary\|secondary>&rd=<path>` | Set cookie (short-lived, see below), `302` to `rd` (open-redirect–guarded; defaults to `/`) |
+| `GET /.auth/select?mode=<key>&rd=<path>` | Set cookie (short-lived, see below), `302` to `rd` (open-redirect–guarded; defaults to `/`). An unconfigured `mode` is a `400` |
 | `GET /.auth/reset?rd=<path>` | **Delete** the cookie, `302` to `rd` (same guard, defaults to `/` → selector page). Cross-origin *subresource* requests get the redirect but keep the cookie |
 | `GET /healthz` | `200` (liveness/readiness) |
 | Backend returns `401`/`403` on one of its own auth endpoints (`/oauth2/*`), **on a navigation** | `302` to `/.auth/reset?rd=/` |
+
+A cookie naming a key that is no longer in `BACKENDS` counts as unknown: those
+users land back on the selector page rather than being silently routed to some
+other provider.
 
 There is **no mode-switch endpoint** by design — a stale oauth2-proxy session
 cookie after a manual switch just re-triggers login. To change provider, hit
@@ -108,8 +118,8 @@ Two consequences worth knowing:
 
 | Var | Default | Notes |
 | --- | --- | --- |
-| `BACKEND_PRIMARY` | *(required)* | Full URL, e.g. `http://oauth2-proxy-primary` |
-| `BACKEND_SECONDARY` | *(required)* | Full URL, e.g. `http://oauth2-proxy-secondary` |
+| `BACKENDS` | *(required)* | Ordered, comma-separated `key=url` list of upstreams, e.g. `corp=http://oauth2-proxy-corp,guest=http://oauth2-proxy-guest`. Order is the button order on the selector page. Keys must match `[a-z0-9_-]{1,64}` (they travel in the cookie, in `?mode=` and into generated HTML classes); duplicates, a malformed URL or an empty list are fatal at startup. Split on the *first* `=`, so a URL may contain `=`. |
+| `BACKEND_LABELS` | *(unset)* | Optional `key=label` list for the button text, e.g. `corp=Corporate SSO,guest=Guest access`. Unlisted keys fall back to the key with its first letter capitalized; a label for an unknown key is fatal. Labels are HTML-escaped when rendered and may not contain a comma. |
 | `LISTEN_ADDR` | `:8080` | |
 | `COOKIE_NAME` | `auth_mode` | |
 | `COOKIE_TEMP_MAX_AGE` | `900` | Seconds a freshly selected, not-yet-proven mode lasts. Matches oauth2-proxy's default CSRF cookie expiry. Must be a positive integer; anything else falls back to the default with a log line. |
@@ -122,6 +132,24 @@ Two consequences worth knowing:
 The three `AUTH_*` vars are what keep the gateway generic: the defaults describe
 oauth2-proxy, but any front door that owns a path prefix and sets a session
 cookie on its callback works by pointing them elsewhere.
+
+### Migrating from `BACKEND_PRIMARY` / `BACKEND_SECONDARY`
+
+Those two vars are **gone**, and setting either is fatal at startup (with this
+migration in the error message) rather than ignored — a silently dropped backend
+URL would leave a gateway that shows everyone the selector page and explains
+nothing.
+
+Reuse the old names as keys and the switch is invisible to users, including the
+routing cookies already in their browsers — the cookie stores the key, so keeping
+the keys keeps the sessions:
+
+```sh
+BACKENDS=primary=$BACKEND_PRIMARY,secondary=$BACKEND_SECONDARY
+```
+
+Picking nicer keys (`corp`, `guest`) is fine too; it just means everyone with a
+`primary`/`secondary` cookie sees the selector once more and picks again.
 
 ## Custom selector page
 
@@ -143,8 +171,8 @@ widget it owns, from
 
 ```html
 <div class="ag-options">
-  <a id="ag-primary" class="ag-btn ag-btn-primary" href="/.auth/select?mode=primary"><span class="ag-logo" aria-hidden="true"></span>Primary</a>
-  <a id="ag-secondary" class="ag-btn ag-btn-secondary" href="/.auth/select?mode=secondary"><span class="ag-logo" aria-hidden="true"></span>Secondary</a>
+  <a class="ag-btn ag-btn-corp" href="/.auth/select?mode=corp"><span class="ag-logo" aria-hidden="true"></span>Corporate SSO</a>
+  <a class="ag-btn ag-btn-guest" href="/.auth/select?mode=guest"><span class="ag-logo" aria-hidden="true"></span>Guest</a>
 </div>
 <script>
   // Preserve where the user was headed so /.auth/select can redirect back.
@@ -152,15 +180,26 @@ widget it owns, from
 </script>
 ```
 
+The anchors are **generated from `BACKENDS`** — one per backend, in config order,
+with the label HTML-escaped — and spliced in together with the script at startup.
+Rendering happens exactly once per process, so serving the page stays a byte copy
+however many providers you list. The script is key-agnostic (it rewrites every
+`.ag-options a.ag-btn` it finds), hence byte-identical across deploys, which is
+what keeps the CSP script hash below stable.
+
 The `ag-*` class names are the **styling contract** — a stable API you may rely
 on: `.ag-options` wraps the buttons, each button is an `ag-btn` anchor with an
-`ag-btn-<mode>` variant class, and each contains an empty `.ag-logo` span (it
+`ag-btn-<key>` variant class, and each contains an empty `.ag-logo` span (it
 renders nothing until a shell styles it — see the logo example below). The
 fragment ships no styling of its own beyond those hooks, so a shell owns the
-whole look. And because the widget is generated rather than authored, a shell
-written today keeps working when the selector becomes dynamic (more than two
-IdPs): the gateway simply renders more `ag-btn` anchors, each with its own
-`.ag-logo`, into the same slot — addressable per mode via `ag-btn-<mode>`.
+whole look.
+
+Because the widget is generated rather than authored, a shell written today keeps
+working as providers come and go: adding a backend renders one more `ag-btn`
+anchor, with its own `.ag-logo`, into the same slot. Style `a.ag-btn` for the look
+every provider shares, and `ag-btn-<key>` when one of them needs its own color or
+logo. The built-in [`selector.html`](selector.html) deliberately styles only
+`a.ag-btn`: with an arbitrary number of IdPs there is no ranking to imply.
 
 Pass the shell as either [`SELECTOR_HTML_FILE`](#configuration-env-vars) (a path,
 read once at startup) or `SELECTOR_HTML` (the HTML itself). Set neither and the
@@ -214,12 +253,12 @@ stated plainly because they are decisions rather than accidents:
   same-origin.
 
 A logo goes on a button through the `.ag-logo` element every button carries
-(empty and zero-size until styled), targeted per mode via the parent class:
+(empty and zero-size until styled), targeted per backend via the parent class:
 
 ```html
 <style>
   .ag-btn { display: flex; align-items: center; gap: .5rem; }
-  .ag-btn-primary .ag-logo {
+  .ag-btn-corp .ag-logo {
     width: 20px; height: 20px;
     background: url("data:image/svg+xml;base64,PHN2ZyB…") center/contain no-repeat;
   }
@@ -232,7 +271,7 @@ to loosen — cosmetic still does not mean arbitrary.
 ### The trust boundary
 
 The shell is **operator-trusted deployment config**, at exactly the same trust
-level as `BACKEND_PRIMARY`: whoever controls the deploy config controls the
+level as `BACKENDS`: whoever controls the deploy config controls the
 page. It never comes from a user, and no request data is ever interpolated into
 it (`rd` is handled client-side by the fixed script, and `/.auth/select`
 validates `mode` and `rd` server-side regardless). The file is read once at
@@ -246,7 +285,7 @@ markup-level spoofing by whoever controls the deploy config: a tampered shell
 can still add look-alike anchors pointing elsewhere, a
 `<meta http-equiv="refresh">` redirect, or a same-origin form. If your deploy
 config is compromised, the selector page is compromised — the same way a
-tampered `BACKEND_PRIMARY` would be. Protect the config; the CSP limits blast
+tampered `BACKENDS` would be. Protect the config; the CSP limits blast
 radius, it does not substitute for that.
 
 Note also that `SELECTOR_HTML` (the inline variant) is visible via
@@ -266,9 +305,9 @@ config:
       <style>
         body { font-family: system-ui; display: grid; place-items: center; min-height: 100vh; }
         .ag-options { display: grid; gap: .75rem; }
-        .ag-btn { padding: .85rem 1.5rem; border-radius: 8px; text-decoration: none; }
-        .ag-btn-primary { background: #2b5cff; color: #fff; }
-        .ag-btn-secondary { background: #eef1f6; color: #1a1a1a; }
+        .ag-btn { padding: .85rem 1.5rem; border-radius: 8px; text-decoration: none;
+                  background: #eef1f6; color: #1a1a1a; }
+        .ag-btn-corp { background: #2b5cff; color: #fff; }
       </style>
     </head>
     <body>
@@ -311,7 +350,9 @@ through the gateway to prove the piping path end-to-end.
 go test ./...
 go build -o auth-gateway .
 
-BACKEND_PRIMARY=http://localhost:4180 BACKEND_SECONDARY=http://localhost:4181 ./auth-gateway
+BACKENDS=corp=http://localhost:4180,guest=http://localhost:4181 \
+  BACKEND_LABELS=corp=Corporate SSO \
+  ./auth-gateway
 ```
 
 Docker (static binary → distroless):
@@ -341,23 +382,41 @@ custom selector page:
 helm install auth-gateway ./charts/auth-gateway \
   --set image.repository=ghcr.io/<owner>/auth-gateway \
   --set image.tag=<sha> \
-  --set config.backendPrimary=http://oauth2-proxy-public \
-  --set config.backendSecondary=http://oauth2-proxy-private
+  --set config.backends[0].key=corp \
+  --set config.backends[0].url=http://oauth2-proxy-public \
+  --set config.backends[1].key=guest \
+  --set config.backends[1].url=http://oauth2-proxy-private
+```
+
+A values file is easier to read once labels are involved:
+
+```yaml
+config:
+  backends:
+    - key: corp
+      url: http://oauth2-proxy-public
+      label: Corporate SSO
+    - key: guest
+      url: http://oauth2-proxy-private
+      label: Guest access
 ```
 
 ### How it works
 
 - **Config is passed as env vars.** Everything under `config.*` in
   [`values.yaml`](charts/auth-gateway/values.yaml) is rendered into the
-  container's `env` (`BACKEND_PRIMARY`, `BACKEND_SECONDARY`, `LISTEN_ADDR`,
-  `COOKIE_NAME`, `COOKIE_TEMP_MAX_AGE`, `AUTH_PATH_PREFIXES`,
-  `AUTH_CALLBACK_PATH`, `AUTH_SESSION_COOKIE`). The one exception is
-  `config.selectorHtml`, which becomes a mounted ConfigMap plus
-  `SELECTOR_HTML_FILE` — see [Custom selector page](#custom-selector-page).
-  `backendPrimary` / `backendSecondary` are **required** — the
-  chart fails to render (`helm template`/`install` errors) if they're unset, so
-  a misconfigured gateway can't reach the cluster. Point them at the two
-  oauth2-proxy Services.
+  container's `env` (`BACKENDS`, `BACKEND_LABELS`, `LISTEN_ADDR`, `COOKIE_NAME`,
+  `COOKIE_TEMP_MAX_AGE`, `AUTH_PATH_PREFIXES`, `AUTH_CALLBACK_PATH`,
+  `AUTH_SESSION_COOKIE`). The one exception is `config.selectorHtml`, which
+  becomes a mounted ConfigMap plus `SELECTOR_HTML_FILE` — see
+  [Custom selector page](#custom-selector-page).
+  `config.backends` is a list of `{key, url, label}` maps (`label` optional) and
+  is **required**: the chart fails to render (`helm template`/`install` errors)
+  when it is empty or when a key/url is missing or malformed, so a misconfigured
+  gateway can't reach the cluster. Point each entry at an oauth2-proxy Service.
+  Upgrading from a chart that had `config.backendPrimary` /
+  `config.backendSecondary`? Those values are gone; see
+  [Migrating from `BACKEND_PRIMARY` / `BACKEND_SECONDARY`](#migrating-from-backend_primary--backend_secondary).
 - **`extraEnv`** is appended verbatim, so secrets flow in the normal way:
 
   ```yaml
@@ -405,4 +464,4 @@ In the chart/manifests that own your ingress:
    Keep both hostnames and ingress classes as-is.
 2. Keep a large `proxy-buffer-size` (e.g. `252k`) for the big auth headers.
 3. No changes to oauth2-proxy config are required (cookie de-collision between
-   the two instances is an accepted risk).
+   the instances is an accepted risk).
