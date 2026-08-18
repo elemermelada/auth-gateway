@@ -19,19 +19,14 @@ image:
 config:
   listenAddr: ":8080"
   cookieName: "auth_mode"
-  ## Lifetime (seconds) of the routing cookie right after the user picks a
-  ## provider. It is promoted to the full ~1 year only once a request succeeds
-  ## behind that provider, so a wrong choice expires by itself.
-  ## 900s matches oauth2-proxy's default CSRF cookie expiry (--cookie-csrf-expire
-  ## 15m) — if you changed that, match it here. Expiring mid-login is recoverable
-  ## (the selector reappears on the callback and resumes it), so this does not
-  ## need slack for slow users.
+  ## Lifetime (seconds) of a freshly picked, not-yet-proven provider choice.
+  ## 900s matches oauth2-proxy's --cookie-csrf-expire default; see README.
   cookieTempMaxAge: 900
   ## The auth front door's own surface. Defaults describe oauth2-proxy; change
   ## them only if you put a different front door behind the gateway or moved
   ## oauth2-proxy's --proxy-prefix.
   ## authPathPrefixes: comma-separated; scopes the auth-error rewrite so app 4xx
-  ## responses are never touched.
+  ## responses are never touched. A "/" entry is ignored for that same reason.
   authPathPrefixes: "/oauth2/"
   ## authCallbackPath + authSessionCookie: a 302 off the callback that also sets
   ## the session cookie is what promotes the routing cookie to its full lifetime.

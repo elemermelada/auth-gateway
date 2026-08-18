@@ -434,6 +434,53 @@ func TestAuthErrorRewrittenForLegacyHTMLRequest(t *testing.T) {
 	}
 }
 
+// A non-browser client sends neither Sec-Fetch-Mode nor Accept: text/html, so the
+// navigation check must fail closed and pass the raw status through.
+func TestAuthErrorNotRewrittenForNonBrowserClient(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "sign-in failed", http.StatusUnauthorized)
+	})
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/auth", nil)
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 passed through", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "sign-in failed") {
+		t.Fatalf("body not preserved: %q", rec.Body.String())
+	}
+}
+
+// The rewritten 302 carries no body, so no header may still describe one.
+func TestAuthErrorRewriteClearsEntityHeaders(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Etag", `"abc"`)
+		w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
+		w.Header().Set("Vary", "Accept-Encoding")
+		http.Error(w, "sign-in failed", http.StatusForbidden)
+	})
+	defer cleanup()
+
+	req := navGET("/oauth2/callback?code=x")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary" + tempSuffix})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	for _, name := range entityHeaders {
+		if v := rec.Header().Get(name); v != "" {
+			t.Errorf("%s survived the rewrite: %q", name, v)
+		}
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+}
+
 // Application 4xx responses are none of the gateway's business — rewriting them
 // would break every app that returns 403 legitimately, and could loop.
 func TestAppErrorNotRewritten(t *testing.T) {
@@ -593,16 +640,17 @@ func TestResetHandledEvenWithValidCookie(t *testing.T) {
 	}
 }
 
-// A cross-site GET to /.auth/reset (an <img>/<iframe> on someone else's page)
-// must not be able to clear the routing cookie. The redirect still happens —
+// A cross-origin subresource GET to /.auth/reset (an <img> on someone else's
+// page) must not be able to clear the routing cookie. The redirect still happens —
 // the endpoint stays GET-reachable for the error rewrite — but the cookie stays.
-func TestResetIgnoresCrossSiteRequest(t *testing.T) {
+func TestResetIgnoresCrossSiteSubresource(t *testing.T) {
 	h, cleanup := testHandler(t)
 	defer cleanup()
 
 	for _, site := range []string{"cross-site", "same-site"} {
 		req := httptest.NewRequest(http.MethodGet, "/.auth/reset", nil)
 		req.Header.Set("Sec-Fetch-Site", site)
+		req.Header.Set("Sec-Fetch-Mode", "no-cors")
 		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -633,6 +681,32 @@ func TestResetAllowedForSameOriginAndDirectNavigation(t *testing.T) {
 		c := routingCookieOf(t, rec)
 		if c == nil || c.MaxAge >= 0 {
 			t.Errorf("Sec-Fetch-Site=%q: cookie not deleted: %+v", site, c)
+		}
+	}
+}
+
+// A link from Slack/email into the app that ends up on /.auth/reset arrives
+// cross-site, and must still clear the cookie — otherwise the user lands back on
+// the wrong backend and can re-enter the same dead end. A top-level navigation
+// can't be silently forged, so allowing it costs nothing.
+func TestResetAllowedForCrossSiteNavigation(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	for _, site := range []string{"cross-site", "same-site"} {
+		req := httptest.NewRequest(http.MethodGet, "/.auth/reset", nil)
+		req.Header.Set("Sec-Fetch-Site", site)
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusFound {
+			t.Errorf("Sec-Fetch-Site=%s: status = %d, want 302", site, rec.Code)
+		}
+		c := routingCookieOf(t, rec)
+		if c == nil || c.MaxAge >= 0 {
+			t.Errorf("Sec-Fetch-Site=%s: cookie not deleted on navigation: %+v", site, c)
 		}
 	}
 }
@@ -671,6 +745,21 @@ func TestIsAuthPathMultiplePrefixes(t *testing.T) {
 		if got := a.isAuthPath(in); got != want {
 			t.Errorf("isAuthPath(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+// A root prefix would classify every path as an auth path, voiding the "never
+// touch application 4xx" guarantee, so it is dropped rather than honored.
+func TestSplitPrefixesDropsRoot(t *testing.T) {
+	if got := splitPrefixes("/"); len(got) != 0 {
+		t.Errorf(`splitPrefixes("/") = %v, want empty`, got)
+	}
+	if got := splitPrefixes("/, /oauth2/"); len(got) != 1 || got[0] != "/oauth2" {
+		t.Errorf(`splitPrefixes("/, /oauth2/") = %v, want ["/oauth2"]`, got)
+	}
+	// Nothing usable left → envPrefixes falls back to the default.
+	if got := envPrefixes("AUTH_PATH_PREFIXES_TEST_UNSET", "/oauth2/"); len(got) != 1 || got[0] != "/oauth2" {
+		t.Errorf("envPrefixes default = %v, want [\"/oauth2\"]", got)
 	}
 }
 

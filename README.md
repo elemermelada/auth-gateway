@@ -20,7 +20,7 @@ ingress ──► auth-gateway ──┬─► oauth2-proxy-primary    ──►
 | No/unknown cookie + `GET` with `Accept: text/html` | `200` embedded selector page (two buttons) |
 | No/unknown cookie + anything else | `401` with small JSON body |
 | `GET /.auth/select?mode=<primary\|secondary>&rd=<path>` | Set cookie (short-lived, see below), `302` to `rd` (open-redirect–guarded; defaults to `/`) |
-| `GET /.auth/reset?rd=<path>` | **Delete** the cookie, `302` to `rd` (same guard, defaults to `/` → selector page). Cross-site requests get the redirect but keep the cookie |
+| `GET /.auth/reset?rd=<path>` | **Delete** the cookie, `302` to `rd` (same guard, defaults to `/` → selector page). Cross-origin *subresource* requests get the redirect but keep the cookie |
 | `GET /healthz` | `200` (liveness/readiness) |
 | Backend returns `401`/`403` on one of its own auth endpoints (`/oauth2/*`), **on a navigation** | `302` to `/.auth/reset?rd=/` |
 
@@ -28,7 +28,7 @@ There is **no mode-switch endpoint** by design — a stale oauth2-proxy session
 cookie after a manual switch just re-triggers login. To change provider, hit
 `/.auth/reset` and pick again.
 
-## Undoing a wrong choice
+## Recovering from a wrong choice
 
 Picking the wrong provider used to be effectively permanent — the cookie lasted
 a year and every request was routed to an IdP that would never let the user in.
@@ -40,9 +40,14 @@ Three mechanisms make it recoverable:
    *"wrong provider? start over"* → `/.auth/reset?rd=/`.
 
    It stays a plain `GET` (mechanism 3 needs a reset reachable by redirect), so
-   cross-site abuse is neutered rather than blocked: if `Sec-Fetch-Site` says
-   `cross-site`/`same-site`, the redirect still happens but the cookie is left
-   alone. Absent header (old clients, curl) is allowed.
+   CSRF abuse is neutered rather than blocked. The cookie is cleared when
+   `Sec-Fetch-Site` is `same-origin`/`none`, when the header is absent (old
+   clients, curl), or when a cross-origin request is a **top-level navigation**
+   (`Sec-Fetch-Mode: navigate`) — a link from Slack or an email that ends up on
+   `/.auth/reset` has to work, and a navigation can't be silently forged the way
+   an `<img>`/`fetch` subresource can. A cross-origin *subresource* still gets its
+   redirect, but keeps the cookie, so a third-party page can't reset someone's
+   provider choice behind their back.
 2. **Two-stage cookie lifetime, promoted by the callback.** `/.auth/select`
    issues the cookie with `COOKIE_TEMP_MAX_AGE` (default `900`s) and the value
    marked `<mode>:tmp`. It is promoted to the full ~1 year exactly when the auth
@@ -107,7 +112,7 @@ Two consequences worth knowing:
 | `LISTEN_ADDR` | `:8080` | |
 | `COOKIE_NAME` | `auth_mode` | |
 | `COOKIE_TEMP_MAX_AGE` | `900` | Seconds a freshly selected, not-yet-proven mode lasts. Matches oauth2-proxy's default CSRF cookie expiry. Must be a positive integer; anything else falls back to the default with a log line. |
-| `AUTH_PATH_PREFIXES` | `/oauth2/` | Comma-separated path prefixes owned by the auth front door. Used to scope the error rewrite and to keep the front door's own endpoints out of the app's namespace. Each entry matches the path itself and everything below it, so `/oauth2` never matches `/oauth2-app`. |
+| `AUTH_PATH_PREFIXES` | `/oauth2/` | Comma-separated path prefixes owned by the auth front door. Used to scope the error rewrite and to keep the front door's own endpoints out of the app's namespace. Each entry matches the path itself and everything below it, so `/oauth2` never matches `/oauth2-app`. A `/` entry is ignored (it would make every path an auth path); if nothing usable is left, the default is used, with a log line. |
 | `AUTH_CALLBACK_PATH` | `/oauth2/callback` | Exact path the IdP redirects back to. A `302` here that sets the session cookie is the promotion signal. |
 | `AUTH_SESSION_COOKIE` | `_oauth2_proxy` | Name **prefix** of the front door's session cookie (oauth2-proxy splits large sessions into `_oauth2_proxy_0`, `_1`, …). |
 

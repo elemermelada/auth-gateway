@@ -47,12 +47,6 @@
       <a id="secondary" class="btn secondary" href="/.auth/select?mode=secondary">Secondary</a>
     </div>
   </main>
-  <!--
-    Downstream apps that want a "wrong provider? start over" affordance should
-    link to /.auth/reset?rd=/ — it clears the routing cookie and brings the user
-    back to this page. No link is needed here: reaching this page already means
-    no mode is selected.
-  -->
   <script>
     // Preserve where the user was headed so /.auth/select can redirect back.
     var rd = encodeURIComponent(location.pathname + location.search);
