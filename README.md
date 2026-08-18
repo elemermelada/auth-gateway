@@ -119,7 +119,7 @@ Two consequences worth knowing:
 | Var | Default | Notes |
 | --- | --- | --- |
 | `BACKENDS` | *(required)* | Ordered, comma-separated `key=url` list of upstreams, e.g. `corp=http://oauth2-proxy-corp,guest=http://oauth2-proxy-guest`. Order is the button order on the selector page. Keys must match `[a-z0-9_-]{1,64}` (they travel in the cookie, in `?mode=` and into generated HTML classes); duplicates, a malformed URL or an empty list are fatal at startup. Split on the *first* `=`, so a URL may contain `=`. |
-| `BACKEND_LABELS` | *(unset)* | Optional `key=label` list for the button text, e.g. `corp=Corporate SSO,guest=Guest access`. Unlisted keys fall back to the key with its first letter capitalized; a label for an unknown key is fatal. Labels are HTML-escaped when rendered and may not contain a comma. |
+| `BACKEND_LABELS` | *(unset)* | Optional `key=label` list for the button text, e.g. `corp=Corporate SSO,guest=Guest access`. Unlisted keys fall back to the key with its first letter capitalized; a label for an unknown key is fatal. Labels are HTML-escaped when rendered and may not contain a comma; a label may contain `=` (entries split on the first `=`). |
 | `LISTEN_ADDR` | `:8080` | |
 | `COOKIE_NAME` | `auth_mode` | |
 | `COOKIE_TEMP_MAX_AGE` | `900` | Seconds a freshly selected, not-yet-proven mode lasts. Matches oauth2-proxy's default CSRF cookie expiry. Must be a positive integer; anything else falls back to the default with a log line. |

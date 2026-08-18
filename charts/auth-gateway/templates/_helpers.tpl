@@ -55,12 +55,17 @@ install instead of the pods.
 {{- fail "config.backends is required: an ordered list of {key, url, label} entries. Migrating from backendPrimary/backendSecondary? Use keys `primary` and `secondary` so existing routing cookies keep working." -}}
 {{- end -}}
 {{- $parts := list -}}
+{{- $seen := dict -}}
 {{- range .Values.config.backends -}}
 {{- if not (regexMatch "^[a-z0-9_-]{1,64}$" (default "" .key)) -}}
 {{- fail (printf "config.backends: key %q must match [a-z0-9_-]{1,64}" (default "" .key)) -}}
 {{- end -}}
-{{- if not .url -}}
-{{- fail (printf "config.backends: entry %q has no url" .key) -}}
+{{- if hasKey $seen .key -}}
+{{- fail (printf "config.backends: key %q is listed more than once" .key) -}}
+{{- end -}}
+{{- $_ := set $seen .key true -}}
+{{- if not (regexMatch "^https?://" (default "" .url)) -}}
+{{- fail (printf "config.backends: entry %q needs a full http(s):// url (got %q)" .key (default "" .url)) -}}
 {{- end -}}
 {{- if or (contains "," .url) (contains "," (default "" .label)) -}}
 {{- fail (printf "config.backends: entry %q must not contain a comma (the env vars are comma-separated lists)" .key) -}}

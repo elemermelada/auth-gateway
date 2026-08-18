@@ -158,7 +158,7 @@ func modeSet(backends []backend) map[string]bool {
 func describeBackends(backends []backend) string {
 	parts := make([]string, 0, len(backends))
 	for _, b := range backends {
-		parts = append(parts, b.key+"="+b.url.String())
+		parts = append(parts, b.key+"="+b.url.Redacted())
 	}
 	return strings.Join(parts, ",")
 }
