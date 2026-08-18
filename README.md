@@ -143,8 +143,8 @@ widget it owns, from
 
 ```html
 <div class="ag-options">
-  <a id="ag-primary" class="ag-btn ag-btn-primary" href="/.auth/select?mode=primary">Primary</a>
-  <a id="ag-secondary" class="ag-btn ag-btn-secondary" href="/.auth/select?mode=secondary">Secondary</a>
+  <a id="ag-primary" class="ag-btn ag-btn-primary" href="/.auth/select?mode=primary"><span class="ag-logo" aria-hidden="true"></span>Primary</a>
+  <a id="ag-secondary" class="ag-btn ag-btn-secondary" href="/.auth/select?mode=secondary"><span class="ag-logo" aria-hidden="true"></span>Secondary</a>
 </div>
 <script>
   // Preserve where the user was headed so /.auth/select can redirect back.
@@ -153,10 +153,14 @@ widget it owns, from
 ```
 
 The `ag-*` class names are the **styling contract** — a stable API you may rely
-on. The fragment ships no styling of its own beyond those hooks, so a shell owns
-the whole look. And because the widget is generated rather than authored, a shell
+on: `.ag-options` wraps the buttons, each button is an `ag-btn` anchor with an
+`ag-btn-<mode>` variant class, and each contains an empty `.ag-logo` span (it
+renders nothing until a shell styles it — see the logo example below). The
+fragment ships no styling of its own beyond those hooks, so a shell owns the
+whole look. And because the widget is generated rather than authored, a shell
 written today keeps working when the selector becomes dynamic (more than two
-IdPs): the gateway simply renders more `ag-btn` anchors into the same slot.
+IdPs): the gateway simply renders more `ag-btn` anchors, each with its own
+`.ag-logo`, into the same slot — addressable per mode via `ag-btn-<mode>`.
 
 Pass the shell as either [`SELECTOR_HTML_FILE`](#configuration-env-vars) (a path,
 read once at startup) or `SELECTOR_HTML` (the HTML itself). Set neither and the
@@ -172,7 +176,11 @@ page — the process exits and the rollout fails instead:
 - both `SELECTOR_HTML_FILE` and `SELECTOR_HTML` set (ambiguous config),
 - `SELECTOR_HTML_FILE` unreadable,
 - the shell missing the placeholder, or containing it more than once,
-- the shell larger than 1 MiB.
+- the shell larger than 1 MiB,
+- the gateway's own fragment not containing exactly one bare `<script>` tag
+  (guards the CSP hash — see below).
+
+Shells must be UTF-8 — the response always declares `charset=utf-8`.
 
 On a successful start the log line carries `selector=<embedded|inline|path>` and
 `sha256=<digest of the rendered page>`, so serving an unexpected page is
@@ -181,7 +189,9 @@ detectable from the logs alone.
 ### One self-contained document
 
 The selector response is served with `Cache-Control: no-store`,
-`X-Content-Type-Options: nosniff`, and a deliberately near-deny-all CSP:
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` (selection
+puts the original destination in the URL as `rd`, which must not leak via
+`Referer`), and a deliberately near-deny-all CSP:
 
 ```
 default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-<fragment script>';
@@ -193,8 +203,9 @@ script bytes** (never hardcoded, so it cannot drift). The practical consequences
 stated plainly because they are decisions rather than accidents:
 
 - **Your JavaScript will not run, by design.** Only the gateway's fragment script
-  matches the hash. This is what makes "cosmetic" enforced rather than promised:
-  even a leaked or tampered ConfigMap cannot rewrite where the buttons point.
+  matches the hash, so no script a shell smuggles in can execute or rewrite the
+  gateway's own widget. (This is a script boundary, not a markup one — see
+  [The trust boundary](#the-trust-boundary) for what it does *not* prevent.)
 - **No external scripts, stylesheets, fonts, or remote images.** `<link
   rel=stylesheet>`, webfont URLs and `<img src=https://…>` are all blocked.
   Inline `<style>` is allowed; images, icons and logos travel inside the document
@@ -202,13 +213,14 @@ stated plainly because they are decisions rather than accidents:
 - The page cannot be framed, cannot set a `<base>`, and can only submit forms
   same-origin.
 
-A logo, for instance, goes on a button through the class hooks:
+A logo goes on a button through the `.ag-logo` element every button carries
+(empty and zero-size until styled), targeted per mode via the parent class:
 
 ```html
 <style>
   .ag-btn { display: flex; align-items: center; gap: .5rem; }
-  .ag-btn-primary::before {
-    content: ""; width: 20px; height: 20px;
+  .ag-btn-primary .ag-logo {
+    width: 20px; height: 20px;
     background: url("data:image/svg+xml;base64,PHN2ZyB…") center/contain no-repeat;
   }
 </style>
@@ -217,15 +229,29 @@ A logo, for instance, goes on a button through the class hooks:
 If a strict `img-src`/`font-src` ever blocks a legitimate use, that is the knob
 to loosen — cosmetic still does not mean arbitrary.
 
-### Why this is safe to expose
+### The trust boundary
 
-The shell comes from the operator's deployment config, exactly like
-`BACKEND_PRIMARY` — never from a user, and no request data is ever interpolated
-into the page (`rd` is handled client-side by the fixed script, and
-`/.auth/select` validates `mode` and `rd` server-side regardless). The file is
-read once at startup, so after boot there is no runtime file access to abuse:
-no traversal, no symlink games, no reload primitive. The CSP is the defense in
-depth behind all of that.
+The shell is **operator-trusted deployment config**, at exactly the same trust
+level as `BACKEND_PRIMARY`: whoever controls the deploy config controls the
+page. It never comes from a user, and no request data is ever interpolated into
+it (`rd` is handled client-side by the fixed script, and `/.auth/select`
+validates `mode` and `rd` server-side regardless). The file is read once at
+startup, so after boot there is no runtime file access to abuse: no traversal,
+no symlink games, no reload primitive.
+
+The CSP's guarantee behind that is precise, and narrower than "nothing to
+spoof": **no script executes except the gateway's own, and nothing can rewrite
+the gateway's widget at runtime.** It does not — and cannot — prevent
+markup-level spoofing by whoever controls the deploy config: a tampered shell
+can still add look-alike anchors pointing elsewhere, a
+`<meta http-equiv="refresh">` redirect, or a same-origin form. If your deploy
+config is compromised, the selector page is compromised — the same way a
+tampered `BACKEND_PRIMARY` would be. Protect the config; the CSP limits blast
+radius, it does not substitute for that.
+
+Note also that `SELECTOR_HTML` (the inline variant) is visible via
+`kubectl describe pod` and `/proc` like any env var — the shell content is
+non-secret by design, so this is fine; just don't put secrets in it.
 
 ### Helm
 

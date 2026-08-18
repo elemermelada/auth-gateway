@@ -222,12 +222,20 @@ func selectorCSP(fragment []byte) (string, error) {
 // hardcoded, so the hash can never drift from the script that actually ships.
 // Browsers hash a script element's text content verbatim, which is exactly the
 // byte range between the tags.
+//
+// It also asserts the fragment holds exactly one bare <script> tag: this
+// function only hashes the first literal <script>…</script> pair, so a second
+// script or an attribute-bearing tag would ship unhashed and be blocked by the
+// CSP at runtime. Failing here makes that a failed rollout instead.
 func inlineScriptHash(fragment []byte) (string, error) {
 	const openTag, closeTag = "<script>", "</script>"
+	if n := bytes.Count(fragment, []byte("<script")); n != 1 {
+		return "", fmt.Errorf("selector fragment contains %d <script> tags, want exactly 1", n)
+	}
 	i := bytes.Index(fragment, []byte(openTag))
 	j := bytes.Index(fragment, []byte(closeTag))
 	if i < 0 || j < i {
-		return "", errors.New("selector fragment has no inline <script> to hash")
+		return "", errors.New("selector fragment has no bare inline <script> to hash")
 	}
 	sum := sha256.Sum256(fragment[i+len(openTag) : j])
 	return "sha256-" + base64.StdEncoding.EncodeToString(sum[:]), nil
@@ -508,12 +516,17 @@ func handleNoMode(w http.ResponseWriter, r *http.Request, sel selectorPage) {
 		// simply wrong — and an auth page must not sit in a shared proxy cache.
 		h.Set("Cache-Control", "no-store")
 		h.Set("X-Content-Type-Options", "nosniff")
+		// Selection puts rd in the URL; keep those paths out of Referer headers.
+		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Content-Security-Policy", sel.csp)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(sel.html)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
+	h.Set("Cache-Control", "no-store")
+	h.Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusUnauthorized)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": "auth mode not selected"})
 }

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -164,6 +165,14 @@ func TestNoCookieNonHTMLReturns401(t *testing.T) {
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
 		t.Fatalf("content-type = %q, want json", ct)
+	}
+	for k, v := range map[string]string{
+		"Cache-Control":          "no-store",
+		"X-Content-Type-Options": "nosniff",
+	} {
+		if got := rec.Header().Get(k); got != v {
+			t.Fatalf("%s = %q, want %q", k, got, v)
+		}
 	}
 }
 
@@ -1054,6 +1063,7 @@ func TestSelectorResponseHeaders(t *testing.T) {
 		"Content-Type":           "text/html; charset=utf-8",
 		"Cache-Control":          "no-store",
 		"X-Content-Type-Options": "nosniff",
+		"Referrer-Policy":        "no-referrer",
 	}
 	for k, v := range want {
 		if got := rec.Header().Get(k); got != v {
@@ -1093,5 +1103,60 @@ func TestSelectorCSPHashMatchesServedScript(t *testing.T) {
 	want := "script-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
 	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, want) {
 		t.Fatalf("CSP %q does not pin the served script (%s)", csp, want)
+	}
+}
+
+// inlineScriptHash only hashes the first bare <script>…</script> pair, so a
+// fragment with a second script or an attribute-bearing tag must fail at
+// startup rather than ship a script the CSP would block.
+func TestInlineScriptHashRequiresExactlyOneBareScript(t *testing.T) {
+	cases := []struct {
+		name     string
+		fragment string
+	}{
+		{"no script", `<div class="ag-options"></div>`},
+		{"two scripts", "<script>a()</script><script>b()</script>"},
+		{"attribute-bearing tag", `<script defer>a()</script>`},
+	}
+	for _, tc := range cases {
+		if _, err := inlineScriptHash([]byte(tc.fragment)); err == nil {
+			t.Fatalf("%s: inlineScriptHash accepted it", tc.name)
+		}
+	}
+
+	fragment, err := selectorFS.ReadFile("selector_fragment.html")
+	if err != nil {
+		t.Fatalf("read embedded fragment: %v", err)
+	}
+	if _, err := inlineScriptHash(fragment); err != nil {
+		t.Fatalf("inlineScriptHash rejected the shipped fragment: %v", err)
+	}
+}
+
+// Pins the fragment's structure from a shell author's perspective: the ag-*
+// class names are a public styling contract, so future fragment edits must not
+// break shells that rely on them.
+func TestSelectorFragmentStylingContract(t *testing.T) {
+	fragment, err := selectorFS.ReadFile("selector_fragment.html")
+	if err != nil {
+		t.Fatalf("read embedded fragment: %v", err)
+	}
+	got := string(fragment)
+
+	if !strings.Contains(got, `<div class="ag-options">`) {
+		t.Fatalf("fragment lost the .ag-options wrapper:\n%s", got)
+	}
+	buttons := regexp.MustCompile(`<a [^>]*class="ag-btn [^"]*"[^>]*>`).FindAllString(got, -1)
+	if len(buttons) != 2 {
+		t.Fatalf("want 2 ag-btn anchors, got %d:\n%s", len(buttons), got)
+	}
+	for _, class := range []string{"ag-btn-primary", "ag-btn-secondary"} {
+		if !strings.Contains(got, class) {
+			t.Fatalf("fragment missing %s:\n%s", class, got)
+		}
+	}
+	// Each button carries a dedicated logo hook, zero-size until a shell styles it.
+	if n := strings.Count(got, `<span class="ag-logo" aria-hidden="true"></span>`); n != len(buttons) {
+		t.Fatalf("want one ag-logo per button (%d), got %d:\n%s", len(buttons), n, got)
 	}
 }
