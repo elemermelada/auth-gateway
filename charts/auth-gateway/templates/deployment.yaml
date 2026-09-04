@@ -51,10 +51,16 @@ spec:
               value: {{ .Values.config.cookieName | quote }}
             - name: COOKIE_TEMP_MAX_AGE
               value: {{ .Values.config.cookieTempMaxAge | quote }}
+            - name: COOKIE_TEMP_MAX_STARTS
+              value: {{ .Values.config.cookieTempMaxStarts | quote }}
             - name: AUTH_PATH_PREFIXES
               value: {{ .Values.config.authPathPrefixes | quote }}
             - name: AUTH_CALLBACK_PATH
               value: {{ .Values.config.authCallbackPath | quote }}
+            {{- with .Values.config.authStartPath }}
+            - name: AUTH_START_PATH
+              value: {{ . | quote }}
+            {{- end }}
             - name: AUTH_SESSION_COOKIE
               value: {{ .Values.config.authSessionCookie | quote }}
             - name: BACKENDS

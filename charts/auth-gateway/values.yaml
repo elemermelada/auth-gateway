@@ -22,6 +22,10 @@ config:
   ## Lifetime (seconds) of a freshly picked, not-yet-proven provider choice.
   ## 900s matches oauth2-proxy's --cookie-csrf-expire default; see README.
   cookieTempMaxAge: 900
+  ## How many sign-in starts one not-yet-proven choice may make before the
+  ## gateway treats it as wrong and sends the user back to the selector.
+  ## 1 = the trip the selection paid for, and no second one.
+  cookieTempMaxStarts: 1
   ## The auth front door's own surface. Defaults describe oauth2-proxy; change
   ## them only if you put a different front door behind the gateway or moved
   ## oauth2-proxy's --proxy-prefix.
@@ -34,6 +38,10 @@ config:
   ## into _oauth2_proxy_0, _1, …).
   authCallbackPath: "/oauth2/callback"
   authSessionCookie: "_oauth2_proxy"
+  ## authStartPath: exact path that hands the user off to the IdP. Empty means
+  ## "any auth path answering with a 302 to another host", which is what makes
+  ## the start counter work without knowing oauth2-proxy's endpoint names.
+  authStartPath: ""
   ## The upstreams to route between: one entry per IdP, any number of them.
   ##   key   — stable id, [a-z0-9_-]{1,64}. It is the value stored in the user's
   ##           routing cookie and used in /.auth/select?mode=<key>, so it must not

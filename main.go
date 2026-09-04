@@ -35,7 +35,10 @@ var selectorFS embed.FS
 const (
 	cookieMaxAge = 365 * 24 * 60 * 60 // ~1 year, in seconds
 	// tempSuffix marks a cookie that was just issued by the selector and has not
-	// yet been confirmed by a successful authenticated request.
+	// yet been confirmed by a successful authenticated request. The full value is
+	// "<mode>:tmp:<starts>", where starts counts the sign-in trips made under this
+	// cookie (see countStart); routing only ever looks at the part before the
+	// first colon, so the counter is invisible to backend selection.
 	tempSuffix = ":tmp"
 	// selectorPlaceholder is the token a selector shell must contain exactly once.
 	// The gateway splices its own selector fragment in its place, which is what
@@ -186,6 +189,10 @@ type cookieCfg struct {
 	// tempMaxAge is the short lifetime a fresh selection gets, so a wrong choice
 	// expires on its own instead of sticking for a year.
 	tempMaxAge int
+	// tempMaxStarts is how many sign-in trips one temporary cookie may make before
+	// the choice is treated as wrong (see countStart). 1 means: the trip the
+	// selection paid for, and no second one.
+	tempMaxStarts int
 	// modes is the set of accepted cookie values: exactly the configured backend
 	// keys. It lives here because every place that reads or writes the routing
 	// cookie needs to know which values are real.
@@ -200,6 +207,10 @@ type authCfg struct {
 	pathPrefixes []string
 	// callbackPath is the exact path the IdP redirects back to.
 	callbackPath string
+	// startPath, when set, is the exact path that hands a user off to the IdP.
+	// Empty means "any auth path other than the callback", which is the default
+	// because the handoff endpoint's name is an oauth2-proxy config detail.
+	startPath string
 	// sessionCookie is the name prefix of the cookie the front door sets once a
 	// session exists. A prefix, because oauth2-proxy splits large sessions into
 	// _oauth2_proxy_0, _1, ….
@@ -237,11 +248,15 @@ func main() {
 			// 15m matches oauth2-proxy's default CSRF cookie expiry: past that the
 			// in-flight login can't complete anyway, so a longer window buys nothing.
 			tempMaxAge: envInt("COOKIE_TEMP_MAX_AGE", 900),
-			modes:      modeSet(backends),
+			// 1: one selection buys one trip to the IdP. A second trip under the same
+			// unproven cookie means the first produced no session — a wrong choice.
+			tempMaxStarts: envInt("COOKIE_TEMP_MAX_STARTS", 1),
+			modes:         modeSet(backends),
 		}
 		auth = authCfg{
 			pathPrefixes:  envPrefixes("AUTH_PATH_PREFIXES", "/oauth2/"),
 			callbackPath:  cleanPath(env("AUTH_CALLBACK_PATH", "/oauth2/callback")),
+			startPath:     envPath("AUTH_START_PATH"),
 			sessionCookie: env("AUTH_SESSION_COOKIE", "_oauth2_proxy"),
 		}
 	)
@@ -260,17 +275,17 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           newHandler(cookie, sel, proxies),
+		Handler:           newHandler(cookie, auth, sel, proxies),
 		MaxHeaderBytes:    1 << 20,           // large injected auth headers (X-Forwarded-Access-Token)
 		ReadHeaderTimeout: 10 * time.Second,  // slow-loris guard on headers only
 		// Deliberately NO ReadTimeout/WriteTimeout/IdleTimeout: they would sever
 		// long-lived WebSocket / SSE / long-polling connections.
 	}
 
-	log.Printf("auth-gateway listening on %s (backends=%s cookie=%s temp_max_age=%ds auth_paths=%s callback=%s session_cookie=%s selector=%s sha256=%s)",
-		listenAddr, describeBackends(backends), cookie.name, cookie.tempMaxAge,
-		strings.Join(auth.pathPrefixes, ","), auth.callbackPath, auth.sessionCookie,
-		sel.source, sel.sha256)
+	log.Printf("auth-gateway listening on %s (backends=%s cookie=%s temp_max_age=%ds temp_max_starts=%d auth_paths=%s callback=%s start=%s session_cookie=%s selector=%s sha256=%s)",
+		listenAddr, describeBackends(backends), cookie.name, cookie.tempMaxAge, cookie.tempMaxStarts,
+		strings.Join(auth.pathPrefixes, ","), auth.callbackPath, describeStartPath(auth.startPath),
+		auth.sessionCookie, sel.source, sel.sha256)
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -415,9 +430,10 @@ func inlineScriptHash(fragment []byte) (string, error) {
 	return "sha256-" + base64.StdEncoding.EncodeToString(sum[:]), nil
 }
 
-// newHandler wires the gateway routing: control endpoints first, then cookie-based
-// backend selection, falling back to the selector page / JSON 401.
-func newHandler(cookie cookieCfg, sel selectorPage, proxies map[string]http.Handler) http.Handler {
+// newHandler wires the gateway routing: control endpoints first, then the
+// mid-login return check, then cookie-based backend selection, falling back to
+// the selector page / JSON 401.
+func newHandler(cookie cookieCfg, auth authCfg, sel selectorPage, proxies map[string]http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Gateway-owned control endpoints, handled regardless of cookie state.
 		switch r.URL.Path {
@@ -433,12 +449,16 @@ func newHandler(cookie cookieCfg, sel selectorPage, proxies map[string]http.Hand
 			return
 		}
 
+		if resetOnReturn(w, r, cookie, auth) {
+			return
+		}
+
 		// Route by our own cookie. Unknown/absent values are treated as absent.
 		if p := proxies[mode(r, cookie)]; p != nil {
 			p.ServeHTTP(w, r)
 			return
 		}
-		handleNoMode(w, r, sel)
+		handleNoMode(w, r, cookie, sel)
 	})
 }
 
@@ -448,7 +468,10 @@ func newHandler(cookie cookieCfg, sel selectorPage, proxies map[string]http.Hand
 func newProxy(target *url.URL, cookie cookieCfg, auth authCfg) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		ModifyResponse: func(resp *http.Response) error {
-			if rewriteAuthError(resp, auth) {
+			if rewriteAuthError(resp, cookie, auth) {
+				return nil
+			}
+			if countStart(resp, cookie, auth) {
 				return nil
 			}
 			promoteCookie(resp, cookie, auth)
@@ -474,28 +497,44 @@ func newProxy(target *url.URL, cookie cookieCfg, auth authCfg) *httputil.Reverse
 // mode returns the validated routing mode from the cookie, or "" if the cookie
 // is missing or holds an unrecognized value (never an error path).
 func mode(r *http.Request, cookie cookieCfg) string {
-	m, _ := cookieMode(r, cookie)
+	m, _, _ := cookieMode(r, cookie)
 	return m
 }
 
-// cookieMode returns the validated routing mode plus whether the cookie is still
-// the short-lived variant issued at selection time (value suffixed with
-// tempSuffix, e.g. "corp:tmp"). A value outside the configured backend keys
-// yields ("", false), so a cookie naming a backend that has since been removed
-// from BACKENDS degrades to the selector page instead of routing somewhere else.
-func cookieMode(r *http.Request, cookie cookieCfg) (m string, temp bool) {
+// cookieMode returns the validated routing mode, whether the cookie is still the
+// short-lived variant issued at selection time, and how many sign-in starts have
+// been counted under it. A temporary value is "<mode>:tmp:<starts>"; the bare
+// "<mode>:tmp" form issued by earlier versions still parses, as starts 0, so a
+// rollout doesn't invalidate logins already in flight.
+//
+// A value outside the configured backend keys yields ("", false, 0), so a cookie
+// naming a backend that has since been removed from BACKENDS degrades to the
+// selector page instead of routing somewhere else. So does an unparseable or
+// negative counter: a hand-edited cookie must not buy extra sign-in trips.
+func cookieMode(r *http.Request, cookie cookieCfg) (m string, temp bool, starts int) {
 	c, err := r.Cookie(cookie.name)
 	if err != nil {
-		return "", false
+		return "", false, 0
 	}
 	v := c.Value
-	if strings.HasSuffix(v, tempSuffix) {
+	if i := strings.Index(v, tempSuffix+":"); i >= 0 {
+		n, err := strconv.Atoi(v[i+len(tempSuffix)+1:])
+		if err != nil || n < 0 {
+			return "", false, 0
+		}
+		v, temp, starts = v[:i], true, n
+	} else if strings.HasSuffix(v, tempSuffix) {
 		v, temp = strings.TrimSuffix(v, tempSuffix), true
 	}
 	if !cookie.modes[v] {
-		return "", false
+		return "", false, 0
 	}
-	return v, temp
+	return v, temp, starts
+}
+
+// tempCookieValue builds the temporary cookie value carrying its start counter.
+func tempCookieValue(m string, starts int) string {
+	return m + tempSuffix + ":" + strconv.Itoa(starts)
 }
 
 // promoteCookie upgrades a still-temporary routing cookie to its full lifetime
@@ -512,7 +551,7 @@ func promoteCookie(resp *http.Response, cookie cookieCfg, auth authCfg) {
 	if !setsSessionCookie(resp, auth.sessionCookie) {
 		return
 	}
-	m, temp := cookieMode(resp.Request, cookie)
+	m, temp, _ := cookieMode(resp.Request, cookie)
 	if m == "" || !temp {
 		return // absent/unknown cookie, or already promoted — don't re-set every request
 	}
@@ -544,7 +583,7 @@ func setsSessionCookie(resp *http.Response, name string) bool {
 // three conditions below is required.
 //
 // It cannot loop: /.auth/reset is served by the gateway itself, never proxied.
-func rewriteAuthError(resp *http.Response, auth authCfg) bool {
+func rewriteAuthError(resp *http.Response, cookie cookieCfg, auth authCfg) bool {
 	if resp.Request == nil || !auth.isAuthPath(resp.Request.URL.Path) {
 		return false
 	}
@@ -557,6 +596,16 @@ func rewriteAuthError(resp *http.Response, auth authCfg) bool {
 		return false
 	}
 
+	m, _, _ := cookieMode(resp.Request, cookie)
+	logReset("autherror", "mode=%s path=%s status=%d", m, cleanPath(resp.Request.URL.Path), resp.StatusCode)
+	redirectToReset(resp)
+	return true
+}
+
+// redirectToReset turns an already-received proxied response into a 302 to
+// /.auth/reset, discarding whatever body it carried. Shared by the two rewrites
+// (rewriteAuthError, countStart) so both produce exactly the same response shape.
+func redirectToReset(resp *http.Response) {
 	_ = resp.Body.Close()
 	resp.Body = http.NoBody
 	resp.ContentLength = 0
@@ -569,7 +618,94 @@ func rewriteAuthError(resp *http.Response, auth authCfg) bool {
 	resp.Header.Set("Location", "/.auth/reset?rd=/")
 	resp.StatusCode = http.StatusFound
 	resp.Status = strconv.Itoa(http.StatusFound) + " " + http.StatusText(http.StatusFound)
+}
+
+// countStart is rule 2 of "catch a wrong choice early": it counts the sign-in
+// trips a single unproven cookie makes, and stops the funnel once the count
+// passes COOKIE_TEMP_MAX_STARTS. It reports whether it rewrote the response.
+// See README: "Recovering from a wrong choice" (mechanism 4).
+//
+// A handoff to the IdP is a 302 off an auth path (or off AUTH_START_PATH exactly,
+// when set) whose Location points at another host. The first one is what the
+// selection paid for and only bumps the counter; the next one means the previous
+// trip came back without a session — the user bounced off the IdP, hit back, or
+// deep-linked mid-login — so it is rewritten to the reset redirect instead of
+// sending them to the same IdP again.
+func countStart(resp *http.Response, cookie cookieCfg, auth authCfg) bool {
+	if resp.StatusCode != http.StatusFound || resp.Request == nil {
+		return false
+	}
+	if !auth.isStartPath(resp.Request.URL.Path) || !isExternalRedirect(resp) {
+		return false
+	}
+	m, temp, starts := cookieMode(resp.Request, cookie)
+	if m == "" || !temp {
+		return false // no unproven choice to judge
+	}
+
+	starts++
+	if starts > cookie.tempMaxStarts {
+		logReset("starts", "mode=%s path=%s starts=%d limit=%d",
+			m, cleanPath(resp.Request.URL.Path), starts, cookie.tempMaxStarts)
+		redirectToReset(resp)
+		return true
+	}
+	// Re-issuing the cookie also restarts tempMaxAge. That is deliberate: the
+	// window is meant to cover one login attempt, and this is the moment a new
+	// attempt begins.
+	resp.Header.Add("Set-Cookie", routingCookie(cookie.name, tempCookieValue(m, starts), cookie.tempMaxAge).String())
+	return false
+}
+
+// isExternalRedirect reports whether a response's Location points at a host other
+// than the one the request was made to — the shape of a handoff to the IdP, as
+// opposed to oauth2-proxy's own internal redirects, which are relative.
+func isExternalRedirect(resp *http.Response) bool {
+	u, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return !strings.EqualFold(u.Host, resp.Request.Host)
+}
+
+// resetOnReturn is rule 1 of "catch a wrong choice early": a top-level navigation
+// that arrives from outside while an unproven cookie is set means the user came
+// back to us without finishing the login — a typed URL, a bookmark, or the "back
+// to the app" link on the IdP's own error page. It reports whether it responded.
+// See README: "Recovering from a wrong choice" (mechanism 4).
+//
+// The callback is the one path exempted: it is a cross-site navigation by
+// definition, and it is the login succeeding. Everything the browser does in
+// between — the redirect off /.auth/select, the rd page, its subresources,
+// /oauth2/start — is same-origin or not a navigation, so it passes untouched.
+func resetOnReturn(w http.ResponseWriter, r *http.Request, cookie cookieCfg, auth authCfg) bool {
+	site := r.Header.Get("Sec-Fetch-Site")
+	if site != "none" && site != "cross-site" {
+		return false // same-origin, same-site, or a client that does not send it
+	}
+	if !isNavigation(r) {
+		return false
+	}
+	p := cleanPath(r.URL.Path)
+	if p == auth.callbackPath {
+		return false
+	}
+	m, temp, _ := cookieMode(r, cookie)
+	if m == "" || !temp {
+		return false
+	}
+
+	logReset("return", "mode=%s path=%s sec_fetch_site=%s", m, p, site)
+	http.Redirect(w, r, "/.auth/reset?rd=/", http.StatusFound)
 	return true
+}
+
+// logReset writes the one line that explains why a routing cookie was discarded.
+// Every reset path goes through it, so "why am I back on the selector?" is always
+// answerable from the logs. Paths only, never query strings: those carry the
+// IdP's code and state.
+func logReset(rule, format string, args ...any) {
+	log.Printf("routing cookie discarded: rule=%s %s", rule, fmt.Sprintf(format, args...))
 }
 
 // isAuthPath reports whether a path belongs to the auth front door's own
@@ -584,6 +720,18 @@ func (a authCfg) isAuthPath(p string) bool {
 		}
 	}
 	return false
+}
+
+// isStartPath reports whether a path is the one that hands the user off to the
+// IdP. With AUTH_START_PATH set it is that exact path; unset, it is any auth path
+// except the callback, which is enough because the handoff is additionally
+// identified by its redirect to another host.
+func (a authCfg) isStartPath(p string) bool {
+	p = cleanPath(p)
+	if a.startPath != "" {
+		return p == a.startPath
+	}
+	return a.isAuthPath(p) && p != a.callbackPath
 }
 
 // cleanPath normalizes a request path (resolving "." / ".." and duplicate
@@ -643,7 +791,7 @@ func handleSelect(w http.ResponseWriter, r *http.Request, cookie cookieCfg) {
 		rd = "/"
 	}
 
-	http.SetCookie(w, routingCookie(cookie.name, m+tempSuffix, cookie.tempMaxAge))
+	http.SetCookie(w, routingCookie(cookie.name, tempCookieValue(m, 0), cookie.tempMaxAge))
 	http.Redirect(w, r, rd, http.StatusFound)
 }
 
@@ -682,7 +830,13 @@ func routingCookie(name, value string, maxAge int) *http.Cookie {
 
 // handleNoMode serves the selector page for browser GETs, and a small JSON 401
 // for everything else.
-func handleNoMode(w http.ResponseWriter, r *http.Request, sel selectorPage) {
+func handleNoMode(w http.ResponseWriter, r *http.Request, cookie cookieCfg, sel selectorPage) {
+	// A cookie we cannot route on is a reset the user never asked for (an expired
+	// or hand-edited value, or a backend dropped from BACKENDS); log it so the
+	// selector hit has the same one-line explanation as every other reset.
+	if c, err := r.Cookie(cookie.name); err == nil && c.Value != "" && mode(r, cookie) == "" {
+		logReset("stale", "path=%s", cleanPath(r.URL.Path))
+	}
 	if r.Method == http.MethodGet && strings.Contains(r.Header.Get("Accept"), "text/html") {
 		h := w.Header()
 		h.Set("Content-Type", "text/html; charset=utf-8")
@@ -761,6 +915,26 @@ func splitPrefixes(raw string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// envPath reads an optional exact-path env var, normalized. Unset stays unset:
+// the empty string is a meaningful value ("no exact path configured"), which is
+// why this cannot go through env() with a default.
+func envPath(key string) string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return ""
+	}
+	return cleanPath(raw)
+}
+
+// describeStartPath renders the start path for the startup log, naming the
+// default rather than logging an empty value.
+func describeStartPath(p string) string {
+	if p == "" {
+		return "(any auth path)"
+	}
+	return p
 }
 
 // envInt reads a positive integer env var, falling back to def when unset,
