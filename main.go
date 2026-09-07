@@ -614,6 +614,10 @@ func redirectToReset(resp *http.Response) {
 	for _, h := range entityHeaders {
 		resp.Header.Del(h)
 	}
+	// The upstream's own Set-Cookie belongs to the response the user never gets
+	// (oauth2-proxy's CSRF cookie for a start that is being cancelled), and the
+	// gateway sets whatever the reset needs itself.
+	resp.Header.Del("Set-Cookie")
 	resp.Header.Set("Cache-Control", "no-store")
 	resp.Header.Set("Location", "/.auth/reset?rd=/")
 	resp.StatusCode = http.StatusFound
@@ -626,13 +630,15 @@ func redirectToReset(resp *http.Response) {
 // See README: "Recovering from a wrong choice" (mechanism 4).
 //
 // A handoff to the IdP is a 302 off an auth path (or off AUTH_START_PATH exactly,
-// when set) whose Location points at another host. The first one is what the
+// when set), on a top-level navigation, whose Location points at another host.
+// The navigation guard is what keeps a prefetched or speculatively loaded auth
+// path from spending the budget on a start the user never made. The first one is what the
 // selection paid for and only bumps the counter; the next one means the previous
 // trip came back without a session — the user bounced off the IdP, hit back, or
 // deep-linked mid-login — so it is rewritten to the reset redirect instead of
 // sending them to the same IdP again.
 func countStart(resp *http.Response, cookie cookieCfg, auth authCfg) bool {
-	if resp.StatusCode != http.StatusFound || resp.Request == nil {
+	if resp.StatusCode != http.StatusFound || resp.Request == nil || !isNavigation(resp.Request) {
 		return false
 	}
 	if !auth.isStartPath(resp.Request.URL.Path) || !isExternalRedirect(resp) {
@@ -660,12 +666,23 @@ func countStart(resp *http.Response, cookie cookieCfg, auth authCfg) bool {
 // isExternalRedirect reports whether a response's Location points at a host other
 // than the one the request was made to — the shape of a handoff to the IdP, as
 // opposed to oauth2-proxy's own internal redirects, which are relative.
+//
+// Compared by hostname, not by the raw host: an absolute same-host redirect that
+// spells out :443 (or a Host header that carries a port the Location omits) is
+// still an internal redirect, and misreading one as a handoff would spend the
+// start budget on a healthy login. A same-hostname-different-port redirect is no
+// IdP handoff in any realistic deployment.
 func isExternalRedirect(resp *http.Response) bool {
 	u, err := url.Parse(resp.Header.Get("Location"))
 	if err != nil || u.Host == "" {
 		return false
 	}
-	return !strings.EqualFold(u.Host, resp.Request.Host)
+	return !strings.EqualFold(u.Hostname(), hostname(resp.Request.Host))
+}
+
+// hostname strips the port (and IPv6 brackets) off a Host header value.
+func hostname(host string) string {
+	return (&url.URL{Host: host}).Hostname()
 }
 
 // resetOnReturn is rule 1 of "catch a wrong choice early": a top-level navigation
@@ -750,7 +767,14 @@ func cleanPath(p string) string {
 // isNavigation reports whether a request is a top-level browser navigation, the
 // only case where turning a response into a redirect makes sense. Sec-Fetch-Mode
 // is authoritative where present; older clients fall back to the Accept header.
+//
+// A prefetch or prerender is excluded even though it is a "navigate": the user
+// has not gone anywhere, so neither the start counter nor a rewrite should act
+// on one.
 func isNavigation(r *http.Request) bool {
+	if strings.Contains(r.Header.Get("Sec-Purpose"), "prefetch") {
+		return false
+	}
 	if m := r.Header.Get("Sec-Fetch-Mode"); m != "" {
 		return m == "navigate"
 	}
@@ -834,7 +858,9 @@ func handleNoMode(w http.ResponseWriter, r *http.Request, cookie cookieCfg, sel 
 	// A cookie we cannot route on is a reset the user never asked for (an expired
 	// or hand-edited value, or a backend dropped from BACKENDS); log it so the
 	// selector hit has the same one-line explanation as every other reset.
-	if c, err := r.Cookie(cookie.name); err == nil && c.Value != "" && mode(r, cookie) == "" {
+	// Navigations only: a page full of subresources under a bogus cookie would
+	// otherwise write one line each, which is a cheap way to fill a disk.
+	if c, err := r.Cookie(cookie.name); err == nil && c.Value != "" && mode(r, cookie) == "" && isNavigation(r) {
 		logReset("stale", "path=%s", cleanPath(r.URL.Path))
 	}
 	if r.Method == http.MethodGet && strings.Contains(r.Header.Get("Accept"), "text/html") {

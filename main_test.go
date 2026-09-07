@@ -1801,3 +1801,110 @@ func TestEnvPath(t *testing.T) {
 		}
 	}
 }
+
+// A prefetched or background-loaded auth path must not spend the start budget:
+// the user has not started anything, and with the default limit of 1 the real
+// click would land as starts=2 and reset.
+func TestStartsNotCountedForNonNavigation(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{"xhr", map[string]string{"Sec-Fetch-Mode": "cors"}},
+		{"no-cors", map[string]string{"Sec-Fetch-Mode": "no-cors"}},
+		{"prefetch", map[string]string{"Sec-Fetch-Mode": "navigate", "Sec-Purpose": "prefetch"}},
+		{"prerender", map[string]string{"Sec-Fetch-Mode": "navigate", "Sec-Purpose": "prefetch;prerender"}},
+	}
+	for _, tc := range cases {
+		h, cleanup := testGatewayTo(t, idpForward)
+
+		// Over the limit already: if this counted, it would be rewritten.
+		req := httptest.NewRequest(http.MethodGet, "/oauth2/start?rd=%2Fapp", nil)
+		for k, v := range tc.headers {
+			req.Header.Set(k, v)
+		}
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "https://idp.example.com/") {
+			t.Errorf("%s: location = %q, want the response untouched", tc.name, loc)
+		}
+		if c := routingCookieOf(t, rec); c != nil {
+			t.Errorf("%s: start counter bumped the cookie: %+v", tc.name, c)
+		}
+		cleanup()
+	}
+}
+
+// A client sending no Sec-Fetch-* headers (legacy Safari) still gets rule 2, via
+// the Accept fallback — dropping it there would leave those users in the loop.
+func TestStartsCountedForLegacyClient(t *testing.T) {
+	h, cleanup := testGatewayTo(t, idpForward)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/start", nil)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if loc := rec.Header().Get("Location"); loc != "/.auth/reset?rd=/" {
+		t.Fatalf("location = %q, want /.auth/reset?rd=/", loc)
+	}
+}
+
+// Only a redirect to another *hostname* is a handoff to the IdP. An absolute
+// same-host redirect (with or without an explicit port on either side) is
+// oauth2-proxy talking to itself and must not spend the budget.
+func TestIsExternalRedirect(t *testing.T) {
+	cases := []struct {
+		reqHost  string
+		location string
+		want     bool
+	}{
+		{"app.example.com", "/oauth2/start?rd=%2Fapp", false},
+		{"app.example.com", "https://app.example.com/oauth2/start", false},
+		{"app.example.com", "https://app.example.com:443/oauth2/start", false},
+		{"app.example.com:8443", "https://app.example.com/oauth2/start", false},
+		{"app.example.com", "https://APP.example.com/oauth2/start", false},
+		{"app.example.com", "https://idp.example.com/authorize", true},
+		{"app.example.com", "//idp.example.com/authorize", true},
+		{"app.example.com", "", false},
+	}
+	for _, tc := range cases {
+		resp := &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": []string{tc.location}},
+			Request:    &http.Request{Host: tc.reqHost},
+		}
+		if got := isExternalRedirect(resp); got != tc.want {
+			t.Errorf("isExternalRedirect(host %q -> %q) = %v, want %v",
+				tc.reqHost, tc.location, got, tc.want)
+		}
+	}
+}
+
+// The blocked start is a healthy upstream response being cancelled: its cookies
+// (oauth2-proxy's CSRF cookie for a login that will not happen) and its caching
+// must not ride along on the reset redirect.
+func TestBlockedStartDropsUpstreamCookies(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "_oauth2_proxy_csrf", Value: "csrf-blob", Path: "/"})
+		w.Header().Set("Cache-Control", "max-age=600")
+		idpForward(w, r)
+	})
+	defer cleanup()
+
+	req := navFrom("/oauth2/start", "same-origin")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if got := rec.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Errorf("Set-Cookie = %q, want the upstream cookies dropped", got)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+}

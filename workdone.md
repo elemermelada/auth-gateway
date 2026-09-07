@@ -47,6 +47,32 @@ top-level navigations carrying an unproven (`:tmp`) cookie.
    later decision (external-host 302 by default, `AUTH_START_PATH` optional) won,
    as the plan is authoritative.
 
+## Review round (PR #14 review, 2026-09-07)
+
+Fixed:
+
+1. **`countStart` had no navigation guard** — a prefetched auth path burned the
+   start budget, so the real click landed as `starts=2` and reset. Now gated on
+   `isNavigation`, and `isNavigation` also excludes `Sec-Purpose: prefetch`
+   (prefetch/prerender is not a navigation for any of the three rewrites).
+2. **`isExternalRedirect` was port-fragile** — raw `u.Host` vs `Request.Host`
+   read `https://app.example.com:443/…` as an IdP handoff. Compares hostnames
+   now (`hostname()` helper).
+3. **`redirectToReset` leaked upstream headers** — drops the upstream
+   `Set-Cookie` (oauth2-proxy's CSRF cookie for a cancelled start); it already
+   set `Cache-Control: no-store`.
+4. **`rule=stale` log flooding** — logged on navigations only.
+
+Documented, not coded: the counter is unauthenticated (README claim softened,
+plus the subdomain cookie-tossing angle), rule 1's false positive is remotely
+triggerable, and the two-tab counter race.
+
+Left for later: signing the cookie (HMAC) — filed as
+[#15](https://github.com/elemermelada/auth-gateway/issues/15).
+
+New tests: non-navigation/prefetch starts, legacy-client start still counted,
+table-driven `isExternalRedirect`, blocked start drops upstream cookies.
+
 ## Not done
 
 - **No compile / vet / test run.** No Go toolchain on this machine, and you said

@@ -89,8 +89,10 @@ Four mechanisms make it recoverable:
    (unknown account, not a member): that happens on the IdP's own page, off our
    site, and the user is left waiting out `COOKIE_TEMP_MAX_AGE`. Two rules close
    that gap. Both look only at **top-level navigations** carrying an unproven
-   (`:tmp`) cookie; subresources and XHR are never touched, since they carry the
-   cookie too and redirecting them would drop it under a live page.
+   (`:tmp`) cookie; subresources, XHR and prefetch/prerender are never touched,
+   since they carry the cookie too — redirecting one would drop it under a live
+   page, and a speculative load would spend the start budget on a start the user
+   never made.
    - **Return.** A navigation whose `Sec-Fetch-Site` is `cross-site` or `none`,
      on any path but `AUTH_CALLBACK_PATH`, means the user came back to us from
      outside without finishing the login — the "back to the app" link on the
@@ -100,9 +102,11 @@ Four mechanisms make it recoverable:
      The callback is exempt because it *is* the cross-site navigation that means
      success. Everything else in a login runs `same-origin` (the redirect off
      `/.auth/select`, the `rd` page, `/oauth2/start`), so a healthy login never
-     trips this. The one false positive is opening an unrelated link to the app
-     in another tab mid-login; that tab lands on the selector, and the login tab
-     recovers with one click.
+     trips this. The false positive is any cross-site navigation to the app
+     mid-login: a link the user opens in another tab, or one a hostile page
+     triggers on purpose. That tab lands on the selector, the login tab recovers
+     with one click, and the window is `COOKIE_TEMP_MAX_AGE` wide — annoyance,
+     not an auth bypass.
    - **Start counter.** The temp cookie value carries how many sign-in trips it
      has made: `<mode>:tmp:<starts>`. A `302` off an auth path whose `Location`
      points at **another host** is the handoff to the IdP; the first one bumps
@@ -112,8 +116,10 @@ Four mechanisms make it recoverable:
      first trip came back without a session — a back button, a reload, a deep
      link into the app mid-login.
 
-     Set `AUTH_START_PATH` to pin the detection to one exact path (e.g.
-     `/oauth2/start`) if your front door redirects off-host for other reasons.
+     Compared by **hostname**, so an absolute same-host redirect that spells out
+     `:443` is still internal. Set `AUTH_START_PATH` to pin the detection to one
+     exact path (e.g. `/oauth2/start`) if your front door redirects off-host for
+     other reasons.
      Re-issuing the cookie also restarts `COOKIE_TEMP_MAX_AGE`: the window covers
      one login attempt, and a counted start is a new attempt beginning.
 
@@ -121,6 +127,11 @@ Four mechanisms make it recoverable:
    recover, exactly like an expired temp cookie. The zero-code alternative is
    lowering `COOKIE_TEMP_MAX_AGE` to 60-120s; that catches the same cases by
    timeout instead of by evidence, and both can be used together.
+
+   The counter is per-cookie, so two tabs starting at once both read the same
+   value and both pass: the effective limit is `COOKIE_TEMP_MAX_STARTS` plus
+   however many starts race. That is by design — a stateless gateway has nowhere
+   else to keep the count.
 
 Every reset writes one log line naming the rule that fired and its evidence:
 
@@ -132,8 +143,9 @@ routing cookie discarded: rule=stale path=/
 ```
 
 `rule=stale` is a cookie the gateway can't route on reaching the selector (a
-value hand-edited, or naming a backend dropped from `BACKENDS`). Paths only,
-never query strings — those carry the IdP's `code` and `state`.
+value hand-edited, or naming a backend dropped from `BACKENDS`); it is logged on
+navigations only, so a bogus cookie can't write a line per subresource. Paths
+only, never query strings — those carry the IdP's `code` and `state`.
 
 Auth paths are classified on the **cleaned** request path, so
 `/oauth2/../app` is treated as the app path it actually resolves to.
@@ -142,8 +154,15 @@ Auth paths are classified on the **cleaned** request path, so
 marker and its counter are invisible to routing. The bare `<mode>:tmp` form
 earlier versions issued still parses (as zero starts), so a rollout doesn't
 invalidate logins already in flight. A counter that isn't a non-negative integer
-invalidates the whole cookie — a hand-edited value must not buy extra trips to
-the IdP.
+invalidates the whole cookie.
+
+The value is **not** authenticated, so the parse guard stops malformed values,
+nothing more: a well-formed `<mode>:tmp:0` planted by hand — or by anything able
+to set a `Domain=`-wide cookie for this host, such as an XSS'd sibling subdomain
+— keeps buying trips, and with rule 1 in play it turns every externally-referred
+visit into a bounce to the selector. Signing the cookie (`…:<mac>` with a
+per-deploy secret) is the fix, and needs key config and rotation, so it is
+tracked separately ([#15](https://github.com/elemermelada/auth-gateway/issues/15)).
 
 ### If the temp cookie expires mid-login
 
