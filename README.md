@@ -42,7 +42,7 @@ cookie after a manual switch just re-triggers login. To change provider, hit
 
 Picking the wrong provider used to be effectively permanent — the cookie lasted
 a year and every request was routed to an IdP that would never let the user in.
-Three mechanisms make it recoverable:
+Four mechanisms make it recoverable:
 
 1. **`/.auth/reset`** — deletes the routing cookie (with the exact attributes it
    was set with, so the deletion actually matches) and sends the user back to the
@@ -60,7 +60,7 @@ Three mechanisms make it recoverable:
    provider choice behind their back.
 2. **Two-stage cookie lifetime, promoted by the callback.** `/.auth/select`
    issues the cookie with `COOKIE_TEMP_MAX_AGE` (default `900`s) and the value
-   marked `<mode>:tmp`. It is promoted to the full ~1 year exactly when the auth
+   marked `<mode>:tmp:<starts>` (see mechanism 4 for the counter). It is promoted to the full ~1 year exactly when the auth
    front door proves the choice: a **`302` off `AUTH_CALLBACK_PATH` that also
    sets `AUTH_SESSION_COOKIE`**. That pair only occurs when the code exchange
    succeeded — a failed callback answers `4xx`/`5xx` and sets no session — so a
@@ -84,12 +84,85 @@ Three mechanisms make it recoverable:
      `Accept: text/html` for old clients). A background XHR to `/oauth2/auth`
      keeps its raw `401`/`403` instead of being dragged through `/.auth/reset`
      and silently dropping the routing cookie under a live page.
+4. **Catching the wrong choice early.** Mechanisms 2 and 3 only fire when the
+   gateway sees the failure. It doesn't when the *IdP itself* refuses the user
+   (unknown account, not a member): that happens on the IdP's own page, off our
+   site, and the user is left waiting out `COOKIE_TEMP_MAX_AGE`. Two rules close
+   that gap. Both look only at **top-level navigations** carrying an unproven
+   (`:tmp`) cookie; subresources, XHR and prefetch/prerender are never touched,
+   since they carry the cookie too — redirecting one would drop it under a live
+   page, and a speculative load would spend the start budget on a start the user
+   never made.
+   - **Return.** A navigation whose `Sec-Fetch-Site` is `cross-site` or `none`,
+     on any path but `AUTH_CALLBACK_PATH`, means the user came back to us from
+     outside without finishing the login — the "back to the app" link on the
+     IdP's error page, a bookmark, a retyped URL. It redirects to
+     `/.auth/reset?rd=/`.
+
+     The callback is exempt because it *is* the cross-site navigation that means
+     success. Everything else in a login runs `same-origin` (the redirect off
+     `/.auth/select`, the `rd` page, `/oauth2/start`), so a healthy login never
+     trips this. The false positive is any cross-site navigation to the app
+     mid-login: a link the user opens in another tab, or one a hostile page
+     triggers on purpose. That tab lands on the selector, the login tab recovers
+     with one click, and the window is `COOKIE_TEMP_MAX_AGE` wide — annoyance,
+     not an auth bypass.
+   - **Start counter.** The temp cookie value carries how many sign-in trips it
+     has made: `<mode>:tmp:<starts>`. A `302` off an auth path whose `Location`
+     points at **another host** is the handoff to the IdP; the first one bumps
+     the counter, and once it passes `COOKIE_TEMP_MAX_STARTS` (default `1`) the
+     `302` is rewritten to `/.auth/reset?rd=/` instead of sending the user to the
+     same provider again. A second start under one unproven cookie means the
+     first trip came back without a session — a back button, a reload, a deep
+     link into the app mid-login.
+
+     Compared by **hostname**, so an absolute same-host redirect that spells out
+     `:443` is still internal. Set `AUTH_START_PATH` to pin the detection to one
+     exact path (e.g. `/oauth2/start`) if your front door redirects off-host for
+     other reasons.
+     Re-issuing the cookie also restarts `COOKIE_TEMP_MAX_AGE`: the window covers
+     one login attempt, and a counted start is a new attempt beginning.
+
+   The cost is that any detour mid-login lands on the selector — one click to
+   recover, exactly like an expired temp cookie. The zero-code alternative is
+   lowering `COOKIE_TEMP_MAX_AGE` to 60-120s; that catches the same cases by
+   timeout instead of by evidence, and both can be used together.
+
+   The counter is per-cookie, so two tabs starting at once both read the same
+   value and both pass: the effective limit is `COOKIE_TEMP_MAX_STARTS` plus
+   however many starts race. That is by design — a stateless gateway has nowhere
+   else to keep the count.
+
+Every reset writes one log line naming the rule that fired and its evidence:
+
+```
+routing cookie discarded: rule=return mode=corp path=/app sec_fetch_site=cross-site
+routing cookie discarded: rule=starts mode=corp path=/oauth2/start starts=2 limit=1
+routing cookie discarded: rule=autherror mode=corp path=/oauth2/callback status=403
+routing cookie discarded: rule=stale path=/
+```
+
+`rule=stale` is a cookie the gateway can't route on reaching the selector (a
+value hand-edited, or naming a backend dropped from `BACKENDS`); it is logged on
+navigations only, so a bogus cookie can't write a line per subresource. Paths
+only, never query strings — those carry the IdP's `code` and `state`.
 
 Auth paths are classified on the **cleaned** request path, so
 `/oauth2/../app` is treated as the app path it actually resolves to.
 
-Both `<mode>` and `<mode>:tmp` route identically, so the marker is invisible to
-routing.
+`<mode>`, `<mode>:tmp` and `<mode>:tmp:<starts>` all route identically, so the
+marker and its counter are invisible to routing. The bare `<mode>:tmp` form
+earlier versions issued still parses (as zero starts), so a rollout doesn't
+invalidate logins already in flight. A counter that isn't a non-negative integer
+invalidates the whole cookie.
+
+The value is **not** authenticated, so the parse guard stops malformed values,
+nothing more: a well-formed `<mode>:tmp:0` planted by hand — or by anything able
+to set a `Domain=`-wide cookie for this host, such as an XSS'd sibling subdomain
+— keeps buying trips, and with rule 1 in play it turns every externally-referred
+visit into a bounce to the selector. Signing the cookie (`…:<mac>` with a
+per-deploy secret) is the fix, and needs key config and rotation, so it is
+tracked separately ([#15](https://github.com/elemermelada/auth-gateway/issues/15)).
 
 ### If the temp cookie expires mid-login
 
@@ -123,13 +196,15 @@ Two consequences worth knowing:
 | `LISTEN_ADDR` | `:8080` | |
 | `COOKIE_NAME` | `auth_mode` | |
 | `COOKIE_TEMP_MAX_AGE` | `900` | Seconds a freshly selected, not-yet-proven mode lasts. Matches oauth2-proxy's default CSRF cookie expiry. Must be a positive integer; anything else falls back to the default with a log line. |
+| `COOKIE_TEMP_MAX_STARTS` | `1` | How many sign-in starts one not-yet-proven choice may make before the gateway treats it as wrong and sends the user to the selector (mechanism 4). `1` = the trip the selection paid for, and no second one. Must be a positive integer; anything else falls back to the default with a log line. |
 | `AUTH_PATH_PREFIXES` | `/oauth2/` | Comma-separated path prefixes owned by the auth front door. Used to scope the error rewrite and to keep the front door's own endpoints out of the app's namespace. Each entry matches the path itself and everything below it, so `/oauth2` never matches `/oauth2-app`. A `/` entry is ignored (it would make every path an auth path); if nothing usable is left, the default is used, with a log line. |
 | `AUTH_CALLBACK_PATH` | `/oauth2/callback` | Exact path the IdP redirects back to. A `302` here that sets the session cookie is the promotion signal. |
+| `AUTH_START_PATH` | *(unset)* | Exact path that hands the user off to the IdP. Unset, **any** auth path answering with a `302` to another host counts as a sign-in start, which is what lets the counter work without knowing the front door's endpoint names. Set it to narrow the detection to one path. |
 | `AUTH_SESSION_COOKIE` | `_oauth2_proxy` | Name **prefix** of the front door's session cookie (oauth2-proxy splits large sessions into `_oauth2_proxy_0`, `_1`, …). |
 | `SELECTOR_HTML_FILE` | *(unset)* | Path to a custom selector **shell**, read **once at startup**. See [Custom selector page](#custom-selector-page). |
 | `SELECTOR_HTML` | *(unset)* | The same shell passed inline, for setups without a volume to mount. Mutually exclusive with `SELECTOR_HTML_FILE` — setting both is fatal. |
 
-The three `AUTH_*` vars are what keep the gateway generic: the defaults describe
+The `AUTH_*` vars are what keep the gateway generic: the defaults describe
 oauth2-proxy, but any front door that owns a path prefix and sets a session
 cookie on its callback works by pointing them elsewhere.
 
@@ -406,7 +481,8 @@ config:
 - **Config is passed as env vars.** Everything under `config.*` in
   [`values.yaml`](charts/auth-gateway/values.yaml) is rendered into the
   container's `env` (`BACKENDS`, `BACKEND_LABELS`, `LISTEN_ADDR`, `COOKIE_NAME`,
-  `COOKIE_TEMP_MAX_AGE`, `AUTH_PATH_PREFIXES`, `AUTH_CALLBACK_PATH`,
+  `COOKIE_TEMP_MAX_AGE`, `COOKIE_TEMP_MAX_STARTS`, `AUTH_PATH_PREFIXES`,
+  `AUTH_CALLBACK_PATH`, `AUTH_START_PATH` (only when non-empty),
   `AUTH_SESSION_COOKIE`). The one exception is `config.selectorHtml`, which
   becomes a mounted ConfigMap plus `SELECTOR_HTML_FILE` — see
   [Custom selector page](#custom-selector-page).

@@ -36,10 +36,11 @@ var testSelector = selectorPage{
 // makes "primary"/"secondary" valid cookie values here; nothing in the gateway
 // knows those names any more.
 var testCookie = cookieCfg{
-	name:       "auth_mode",
-	maxAge:     cookieMaxAge,
-	tempMaxAge: 900,
-	modes:      map[string]bool{"primary": true, "secondary": true},
+	name:          "auth_mode",
+	maxAge:        cookieMaxAge,
+	tempMaxAge:    900,
+	tempMaxStarts: 1,
+	modes:         map[string]bool{"primary": true, "secondary": true},
 }
 
 // testCookieFor is testCookie with a different set of backend keys.
@@ -87,7 +88,7 @@ func testHandler(t *testing.T) (http.Handler, func()) {
 		"primary":   newProxy(mustParse(t, primary.URL), testCookie, testAuth),
 		"secondary": newProxy(mustParse(t, secondary.URL), testCookie, testAuth),
 	}
-	h := newHandler(testCookie, testSelector, proxies)
+	h := newHandler(testCookie, testAuth, testSelector, proxies)
 	return h, func() { primary.Close(); secondary.Close() }
 }
 
@@ -105,7 +106,7 @@ func testGatewayKeys(t *testing.T, keys ...string) (http.Handler, cookieCfg, fun
 		servers = append(servers, srv)
 		proxies[key] = newProxy(mustParse(t, srv.URL), cookie, testAuth)
 	}
-	h := newHandler(cookie, testSelector, proxies)
+	h := newHandler(cookie, testAuth, testSelector, proxies)
 	return h, cookie, func() {
 		for _, srv := range servers {
 			srv.Close()
@@ -119,7 +120,7 @@ func testGatewayTo(t *testing.T, backend http.HandlerFunc) (http.Handler, func()
 	t.Helper()
 	srv := httptest.NewServer(backend)
 	proxies := map[string]http.Handler{"primary": newProxy(mustParse(t, srv.URL), testCookie, testAuth)}
-	return newHandler(testCookie, testSelector, proxies), srv.Close
+	return newHandler(testCookie, testAuth, testSelector, proxies), srv.Close
 }
 
 // routingCookieOf returns the Set-Cookie entry for the routing cookie, or nil.
@@ -242,7 +243,7 @@ func TestSelectSetsCookieAndRedirects(t *testing.T) {
 		t.Fatalf("location = %q, want /dashboard", loc)
 	}
 	sc := rec.Result().Cookies()
-	if len(sc) != 1 || sc[0].Value != "secondary"+tempSuffix || !sc[0].Secure || !sc[0].HttpOnly {
+	if len(sc) != 1 || sc[0].Value != tempCookieValue("secondary", 0) || !sc[0].Secure || !sc[0].HttpOnly {
 		t.Fatalf("cookie not set correctly: %+v", sc)
 	}
 	// A fresh selection is unproven: it only gets the short lifetime.
@@ -580,24 +581,35 @@ func TestAuthPathNonErrorNotRewritten(t *testing.T) {
 
 func TestCookieMode(t *testing.T) {
 	cases := []struct {
-		value    string
-		wantMode string
-		wantTemp bool
+		value      string
+		wantMode   string
+		wantTemp   bool
+		wantStarts int
 	}{
-		{"primary", "primary", false},
-		{"secondary", "secondary", false},
-		{"primary" + tempSuffix, "primary", true},
-		{"secondary" + tempSuffix, "secondary", true},
-		{"bogus", "", false},
-		{"bogus" + tempSuffix, "", false},
-		{tempSuffix, "", false},
+		{"primary", "primary", false, 0},
+		{"secondary", "secondary", false, 0},
+		// The bare ":tmp" form is what older versions issued; it must keep working
+		// across a rollout, counting as no starts yet.
+		{"primary" + tempSuffix, "primary", true, 0},
+		{"secondary" + tempSuffix, "secondary", true, 0},
+		{tempCookieValue("primary", 0), "primary", true, 0},
+		{tempCookieValue("primary", 3), "primary", true, 3},
+		{"bogus", "", false, 0},
+		{"bogus" + tempSuffix, "", false, 0},
+		{tempSuffix, "", false, 0},
+		// A counter that is not a non-negative integer invalidates the whole cookie:
+		// a hand-edited value must not buy extra trips to the IdP.
+		{tempCookieValue("primary", -1), "", false, 0},
+		{"primary" + tempSuffix + ":x", "", false, 0},
+		{"primary" + tempSuffix + ":", "", false, 0},
 	}
 	for _, tc := range cases {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tc.value})
-		m, temp := cookieMode(req, testCookie)
-		if m != tc.wantMode || temp != tc.wantTemp {
-			t.Errorf("cookieMode(%q) = (%q, %v), want (%q, %v)", tc.value, m, temp, tc.wantMode, tc.wantTemp)
+		m, temp, starts := cookieMode(req, testCookie)
+		if m != tc.wantMode || temp != tc.wantTemp || starts != tc.wantStarts {
+			t.Errorf("cookieMode(%q) = (%q, %v, %d), want (%q, %v, %d)",
+				tc.value, m, temp, starts, tc.wantMode, tc.wantTemp, tc.wantStarts)
 		}
 	}
 }
@@ -871,7 +883,7 @@ func TestWebSocketUpgradeProxied(t *testing.T) {
 	defer backend.Close()
 
 	proxies := map[string]http.Handler{"primary": newProxy(mustParse(t, backend.URL), testCookie, testAuth)}
-	gw := httptest.NewServer(newHandler(testCookie, testSelector, proxies))
+	gw := httptest.NewServer(newHandler(testCookie, testAuth, testSelector, proxies))
 	defer gw.Close()
 
 	gwURL := mustParse(t, gw.URL)
@@ -1111,7 +1123,7 @@ func TestSelectorResponseHeaders(t *testing.T) {
 	clearSelectorEnv(t)
 
 	sel := mustLoadSelector(t)
-	h := newHandler(testCookie, sel, nil)
+	h := newHandler(testCookie, testAuth, sel, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("Accept", "text/html")
@@ -1154,7 +1166,7 @@ func TestSelectorCSPHashMatchesServedScript(t *testing.T) {
 	clearSelectorEnv(t)
 
 	sel := mustLoadSelector(t)
-	h := newHandler(testCookie, sel, nil)
+	h := newHandler(testCookie, testAuth, sel, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("Accept", "text/html")
@@ -1427,8 +1439,8 @@ func TestSelectAcceptsConfiguredKeysOnly(t *testing.T) {
 		t.Fatalf("status = %d, want 302", rec.Code)
 	}
 	c := routingCookieOf(t, rec)
-	if c == nil || c.Value != "corp"+tempSuffix {
-		t.Fatalf("routing cookie = %+v, want value %q", c, "corp"+tempSuffix)
+	if c == nil || c.Value != tempCookieValue("corp", 0) {
+		t.Fatalf("routing cookie = %+v, want value %q", c, tempCookieValue("corp", 0))
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/.auth/select?mode=primary", nil)
@@ -1447,7 +1459,7 @@ func TestPromotionForCustomKey(t *testing.T) {
 
 	cookie := testCookieFor("corp")
 	proxies := map[string]http.Handler{"corp": newProxy(mustParse(t, srv.URL), cookie, testAuth)}
-	h := newHandler(cookie, testSelector, proxies)
+	h := newHandler(cookie, testAuth, testSelector, proxies)
 
 	req := navGET("/oauth2/callback?code=abc&state=xyz")
 	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "corp" + tempSuffix})
@@ -1460,5 +1472,439 @@ func TestPromotionForCustomKey(t *testing.T) {
 	}
 	if c.Value != "corp" || c.MaxAge != cookieMaxAge {
 		t.Fatalf("routing cookie = (%q, %d), want (%q, %d)", c.Value, c.MaxAge, "corp", cookieMaxAge)
+	}
+}
+
+// idpForward is oauth2-proxy handing the browser off to the IdP: a 302 to another
+// host. That response, on an auth path, is what the start counter counts.
+func idpForward(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "https://idp.example.com/authorize?client_id=x", http.StatusFound)
+}
+
+// navFrom builds a top-level navigation carrying a Sec-Fetch-Site value.
+func navFrom(target, site string) *http.Request {
+	req := navGET(target)
+	req.Header.Set("Sec-Fetch-Site", site)
+	return req
+}
+
+// The first handoff to the IdP is the one the selection paid for: it goes
+// through, and only bumps the counter in the cookie.
+func TestFirstStartIsCountedNotBlocked(t *testing.T) {
+	h, cleanup := testGatewayTo(t, idpForward)
+	defer cleanup()
+
+	req := navFrom("/oauth2/start?rd=%2Fapp", "same-origin")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 0)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "https://idp.example.com/") {
+		t.Fatalf("location = %q, want the IdP handoff to pass through", loc)
+	}
+	c := routingCookieOf(t, rec)
+	if c == nil || c.Value != tempCookieValue("primary", 1) {
+		t.Fatalf("routing cookie = %+v, want value %q", c, tempCookieValue("primary", 1))
+	}
+	if c.MaxAge != testCookie.tempMaxAge {
+		t.Fatalf("routing cookie MaxAge = %d, want the temp lifetime %d", c.MaxAge, testCookie.tempMaxAge)
+	}
+}
+
+// A second handoff under the same unproven cookie means the first trip produced
+// no session: the user goes to the selector instead of back to the same IdP.
+func TestSecondStartResetsInsteadOfLoopingToIdP(t *testing.T) {
+	h, cleanup := testGatewayTo(t, idpForward)
+	defer cleanup()
+
+	req := navFrom("/oauth2/start?rd=%2Fapp", "same-origin")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/.auth/reset?rd=/" {
+		t.Fatalf("location = %q, want /.auth/reset?rd=/", loc)
+	}
+}
+
+// A deep link into the app mid-login is caught one redirect later, when it
+// re-enters the funnel — this is what replaced the dropped rd allowlist.
+func TestDeepLinkMidLoginResetsAtItsStart(t *testing.T) {
+	h, cleanup := testGatewayTo(t, idpForward)
+	defer cleanup()
+
+	// The deep link itself is same-origin (an in-app link), so rule 1 lets it by;
+	// the redirect it triggers into /oauth2/start is the second start.
+	req := navFrom("/oauth2/start?rd=%2Fdeep", "same-origin")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if loc := rec.Header().Get("Location"); loc != "/.auth/reset?rd=/" {
+		t.Fatalf("location = %q, want /.auth/reset?rd=/", loc)
+	}
+}
+
+// COOKIE_TEMP_MAX_STARTS is the budget, and it is configurable.
+func TestStartLimitIsConfigurable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(idpForward))
+	defer srv.Close()
+
+	cookie := testCookie
+	cookie.tempMaxStarts = 2
+	h := newHandler(cookie, testAuth, testSelector,
+		map[string]http.Handler{"primary": newProxy(mustParse(t, srv.URL), cookie, testAuth)})
+
+	req := navFrom("/oauth2/start", "same-origin")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "https://idp.example.com/") {
+		t.Fatalf("location = %q, want the second start allowed at limit 2", loc)
+	}
+}
+
+// oauth2-proxy's own internal redirects (sign_in -> start, callback -> app) stay
+// on our host and are not handoffs, so they must not consume the budget.
+func TestInternalRedirectIsNotAStart(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/oauth2/start?rd=%2Fapp", http.StatusFound)
+	})
+	defer cleanup()
+
+	req := navFrom("/oauth2/sign_in", "same-origin")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if loc := rec.Header().Get("Location"); loc != "/oauth2/start?rd=%2Fapp" {
+		t.Fatalf("location = %q, want the internal redirect untouched", loc)
+	}
+	if c := routingCookieOf(t, rec); c != nil {
+		t.Fatalf("internal redirect touched the cookie: %+v", c)
+	}
+}
+
+// An app path that happens to redirect off-site is not a sign-in start.
+func TestExternalRedirectOffAnAppPathIsNotAStart(t *testing.T) {
+	h, cleanup := testGatewayTo(t, idpForward)
+	defer cleanup()
+
+	req := navFrom("/app/go", "same-origin")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "https://idp.example.com/") {
+		t.Fatalf("location = %q, want the app redirect untouched", loc)
+	}
+	if c := routingCookieOf(t, rec); c != nil {
+		t.Fatalf("app redirect touched the cookie: %+v", c)
+	}
+}
+
+// AUTH_START_PATH narrows the counter to one exact path.
+func TestStartPathNarrowsDetection(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(idpForward))
+	defer srv.Close()
+
+	auth := testAuth
+	auth.startPath = "/oauth2/start"
+	h := newHandler(testCookie, auth, testSelector,
+		map[string]http.Handler{"primary": newProxy(mustParse(t, srv.URL), testCookie, auth)})
+
+	// Over the limit, but on a different auth path: not a start any more.
+	req := navFrom("/oauth2/sign_in", "same-origin")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "https://idp.example.com/") {
+		t.Fatalf("location = %q, want /oauth2/sign_in exempt from the counter", loc)
+	}
+
+	req = navFrom("/oauth2/start", "same-origin")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if loc := rec.Header().Get("Location"); loc != "/.auth/reset?rd=/" {
+		t.Fatalf("location = %q, want the configured start path counted", loc)
+	}
+}
+
+// A proven (full) cookie has nothing to prove: sign-ins are never counted.
+func TestStartsNotCountedForFullCookie(t *testing.T) {
+	h, cleanup := testGatewayTo(t, idpForward)
+	defer cleanup()
+
+	req := navFrom("/oauth2/start", "same-origin")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "https://idp.example.com/") {
+		t.Fatalf("location = %q, want a re-login on a proven cookie to pass", loc)
+	}
+	if c := routingCookieOf(t, rec); c != nil {
+		t.Fatalf("full cookie was rewritten by the start counter: %+v", c)
+	}
+}
+
+// Coming back from outside mid-login (typed URL, bookmark, the IdP error page's
+// "back to the app" link) means the login never finished: reset.
+func TestCrossSiteReturnResets(t *testing.T) {
+	for _, site := range []string{"cross-site", "none"} {
+		h, cleanup := testHandler(t)
+
+		req := navFrom("/app", site)
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusFound {
+			t.Errorf("%s: status = %d, want 302", site, rec.Code)
+		}
+		if loc := rec.Header().Get("Location"); loc != "/.auth/reset?rd=/" {
+			t.Errorf("%s: location = %q, want /.auth/reset?rd=/", site, loc)
+		}
+		cleanup()
+	}
+}
+
+// The callback is a cross-site navigation by definition — and it is the login
+// working. It must never trip the return check.
+func TestCallbackExemptFromReturnCheck(t *testing.T) {
+	h, cleanup := testGatewayTo(t, successfulCallback)
+	defer cleanup()
+
+	req := navFrom("/oauth2/callback?code=x&state=y", "cross-site")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	c := routingCookieOf(t, rec)
+	if c == nil || c.Value != "primary" {
+		t.Fatalf("routing cookie = %+v, want the cross-site callback to promote", c)
+	}
+}
+
+// The whole login runs same-origin after the selector, so nothing in it trips the
+// return check: the select redirect, the rd page and /oauth2/start all pass.
+func TestSameOriginNavigationPassesDuringLogin(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	for _, site := range []string{"same-origin", "same-site", ""} {
+		req := navFrom("/app", site)
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 0)})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if got := rec.Body.String(); got != "backend=primary" {
+			t.Errorf("Sec-Fetch-Site %q: body = %q, want the request proxied", site, got)
+		}
+	}
+}
+
+// Subresources and XHR carry the cookie too (SameSite=Lax only restricts
+// cross-site sends), so the return check is navigation-only. Redirecting a
+// stylesheet or a fetch would drop the cookie under a page mid-login.
+func TestCrossSiteSubresourcePassesUntouched(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	for _, mode := range []string{"cors", "no-cors", "same-origin"} {
+		req := httptest.NewRequest(http.MethodGet, "/static/app.css", nil)
+		req.Header.Set("Sec-Fetch-Mode", mode)
+		req.Header.Set("Sec-Fetch-Site", "cross-site")
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 0)})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if got := rec.Body.String(); got != "backend=primary" {
+			t.Errorf("Sec-Fetch-Mode %q: body = %q, want the subresource proxied", mode, got)
+		}
+	}
+}
+
+// A proven cookie is nobody's mid-login state: an inbound link from anywhere must
+// keep routing, not sign the user out.
+func TestCrossSiteReturnIgnoresFullCookie(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	req := navFrom("/app", "cross-site")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: "primary"})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if got := rec.Body.String(); got != "backend=primary" {
+		t.Fatalf("body = %q, want a proven cookie to keep routing", got)
+	}
+}
+
+// The control endpoints are gateway-owned and run before the return check, so
+// /.auth/reset itself can be reached cross-site — otherwise the redirect the
+// check emits would loop.
+func TestReturnCheckDoesNotLoopOnReset(t *testing.T) {
+	h, cleanup := testHandler(t)
+	defer cleanup()
+
+	req := navFrom("/.auth/reset?rd=/", "cross-site")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if loc := rec.Header().Get("Location"); loc != "/" {
+		t.Fatalf("location = %q, want the reset endpoint to answer normally", loc)
+	}
+	if c := routingCookieOf(t, rec); c == nil || c.MaxAge >= 0 {
+		t.Fatalf("routing cookie = %+v, want a deletion", c)
+	}
+}
+
+// A start path is any auth path but the callback, unless AUTH_START_PATH pins it.
+func TestIsStartPath(t *testing.T) {
+	narrowed := testAuth
+	narrowed.startPath = "/oauth2/start"
+	cases := []struct {
+		auth authCfg
+		path string
+		want bool
+	}{
+		{testAuth, "/oauth2/start", true},
+		{testAuth, "/oauth2/sign_in", true},
+		{testAuth, "/oauth2/callback", false},
+		{testAuth, "/app", false},
+		{narrowed, "/oauth2/start", true},
+		{narrowed, "/oauth2/start/", true},
+		{narrowed, "/oauth2/sign_in", false},
+	}
+	for _, tc := range cases {
+		if got := tc.auth.isStartPath(tc.path); got != tc.want {
+			t.Errorf("isStartPath(%q) with startPath %q = %v, want %v",
+				tc.path, tc.auth.startPath, got, tc.want)
+		}
+	}
+}
+
+func TestEnvPath(t *testing.T) {
+	cases := map[string]string{"": "", "  ": "", "/oauth2/start": "/oauth2/start",
+		"oauth2/start": "/oauth2/start", "/oauth2//start/": "/oauth2/start"}
+	for raw, want := range cases {
+		t.Setenv("AUTH_START_PATH", raw)
+		if got := envPath("AUTH_START_PATH"); got != want {
+			t.Errorf("envPath(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+// A prefetched or background-loaded auth path must not spend the start budget:
+// the user has not started anything, and with the default limit of 1 the real
+// click would land as starts=2 and reset.
+func TestStartsNotCountedForNonNavigation(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{"xhr", map[string]string{"Sec-Fetch-Mode": "cors"}},
+		{"no-cors", map[string]string{"Sec-Fetch-Mode": "no-cors"}},
+		{"prefetch", map[string]string{"Sec-Fetch-Mode": "navigate", "Sec-Purpose": "prefetch"}},
+		{"prerender", map[string]string{"Sec-Fetch-Mode": "navigate", "Sec-Purpose": "prefetch;prerender"}},
+	}
+	for _, tc := range cases {
+		h, cleanup := testGatewayTo(t, idpForward)
+
+		// Over the limit already: if this counted, it would be rewritten.
+		req := httptest.NewRequest(http.MethodGet, "/oauth2/start?rd=%2Fapp", nil)
+		for k, v := range tc.headers {
+			req.Header.Set(k, v)
+		}
+		req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "https://idp.example.com/") {
+			t.Errorf("%s: location = %q, want the response untouched", tc.name, loc)
+		}
+		if c := routingCookieOf(t, rec); c != nil {
+			t.Errorf("%s: start counter bumped the cookie: %+v", tc.name, c)
+		}
+		cleanup()
+	}
+}
+
+// A client sending no Sec-Fetch-* headers (legacy Safari) still gets rule 2, via
+// the Accept fallback — dropping it there would leave those users in the loop.
+func TestStartsCountedForLegacyClient(t *testing.T) {
+	h, cleanup := testGatewayTo(t, idpForward)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/start", nil)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if loc := rec.Header().Get("Location"); loc != "/.auth/reset?rd=/" {
+		t.Fatalf("location = %q, want /.auth/reset?rd=/", loc)
+	}
+}
+
+// Only a redirect to another *hostname* is a handoff to the IdP. An absolute
+// same-host redirect (with or without an explicit port on either side) is
+// oauth2-proxy talking to itself and must not spend the budget.
+func TestIsExternalRedirect(t *testing.T) {
+	cases := []struct {
+		reqHost  string
+		location string
+		want     bool
+	}{
+		{"app.example.com", "/oauth2/start?rd=%2Fapp", false},
+		{"app.example.com", "https://app.example.com/oauth2/start", false},
+		{"app.example.com", "https://app.example.com:443/oauth2/start", false},
+		{"app.example.com:8443", "https://app.example.com/oauth2/start", false},
+		{"app.example.com", "https://APP.example.com/oauth2/start", false},
+		{"app.example.com", "https://idp.example.com/authorize", true},
+		{"app.example.com", "//idp.example.com/authorize", true},
+		{"app.example.com", "", false},
+	}
+	for _, tc := range cases {
+		resp := &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": []string{tc.location}},
+			Request:    &http.Request{Host: tc.reqHost},
+		}
+		if got := isExternalRedirect(resp); got != tc.want {
+			t.Errorf("isExternalRedirect(host %q -> %q) = %v, want %v",
+				tc.reqHost, tc.location, got, tc.want)
+		}
+	}
+}
+
+// The blocked start is a healthy upstream response being cancelled: its cookies
+// (oauth2-proxy's CSRF cookie for a login that will not happen) and its caching
+// must not ride along on the reset redirect.
+func TestBlockedStartDropsUpstreamCookies(t *testing.T) {
+	h, cleanup := testGatewayTo(t, func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "_oauth2_proxy_csrf", Value: "csrf-blob", Path: "/"})
+		w.Header().Set("Cache-Control", "max-age=600")
+		idpForward(w, r)
+	})
+	defer cleanup()
+
+	req := navFrom("/oauth2/start", "same-origin")
+	req.AddCookie(&http.Cookie{Name: "auth_mode", Value: tempCookieValue("primary", 1)})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if got := rec.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Errorf("Set-Cookie = %q, want the upstream cookies dropped", got)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
 	}
 }
